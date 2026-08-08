@@ -36,13 +36,13 @@ git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl", "
 # Token 存 Windows 凭据管理器
 keyring = { version = "3", features = ["windows-native"] }
 
-# 读取 Windows 系统代理设置（Internet Options），让 git 自动走系统代理
-[target.'cfg(windows)'.dependencies]
-winreg = "0.55"
-
 # 主密码密钥派生与数据加密
 argon2 = "0.5"
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
 sha2 = "0.10"
+
+# 读取 Windows 系统代理设置（Internet Options），让 git 自动走系统代理
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
