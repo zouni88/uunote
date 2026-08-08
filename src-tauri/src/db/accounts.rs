@@ -1,10 +1,14 @@
 //! 账号 CRUD（密码以密文存储，加解密在命令层完成）
+//!
+//! 所有变更在同一事务内写入同步操作日志（sync_outbox），
+//! 并更新记录行的版本（v_lamport/v_device）供跨设备合并。
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::db::outbox;
 use crate::error::AppResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,33 +69,42 @@ pub fn create(conn: &Connection, account: &Account) -> AppResult<Account> {
         updated_at: now,
         ..account.clone()
     };
-    conn.execute(
-        "INSERT INTO accounts (id, title, username, password_enc, url, notes, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    let tx = conn.unchecked_transaction()?;
+    let op = outbox::record(&tx, "account", "upsert", &acc.id, &serde_json::to_string(&acc)?)?;
+    tx.execute(
+        "INSERT INTO accounts (id, title, username, password_enc, url, notes, created_at, updated_at, v_lamport, v_device)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         (
             &acc.id, &acc.title, &acc.username, &acc.password_enc, &acc.url,
-            &acc.notes, &acc.created_at, &acc.updated_at,
+            &acc.notes, &acc.created_at, &acc.updated_at, op.lamport, &op.device_id,
         ),
     )?;
+    tx.commit()?;
     Ok(acc)
 }
 
 pub fn update(conn: &Connection, account: &Account) -> AppResult<Account> {
     let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "UPDATE accounts SET title = ?1, username = ?2, password_enc = ?3, url = ?4,
-         notes = ?5, updated_at = ?6 WHERE id = ?7",
-        (
-            &account.title, &account.username, &account.password_enc, &account.url,
-            &account.notes, &now, &account.id,
-        ),
-    )?;
     let mut updated = account.clone();
     updated.updated_at = now;
+    let tx = conn.unchecked_transaction()?;
+    let op = outbox::record(&tx, "account", "upsert", &account.id, &serde_json::to_string(&updated)?)?;
+    tx.execute(
+        "UPDATE accounts SET title = ?1, username = ?2, password_enc = ?3, url = ?4,
+         notes = ?5, updated_at = ?6, v_lamport = ?7, v_device = ?8 WHERE id = ?9",
+        (
+            &updated.title, &updated.username, &updated.password_enc, &updated.url,
+            &updated.notes, &updated.updated_at, op.lamport, &op.device_id, &account.id,
+        ),
+    )?;
+    tx.commit()?;
     Ok(updated)
 }
 
 pub fn delete(conn: &Connection, id: &str) -> AppResult<()> {
-    conn.execute("DELETE FROM accounts WHERE id = ?1", (id,))?;
+    let tx = conn.unchecked_transaction()?;
+    outbox::record(&tx, "account", "delete", id, "")?;
+    tx.execute("DELETE FROM accounts WHERE id = ?1", (id,))?;
+    tx.commit()?;
     Ok(())
 }

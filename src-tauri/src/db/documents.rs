@@ -1,10 +1,14 @@
 //! 重要资料 CRUD（元数据入库，加密文件本体存放于 vault 目录）
+//!
+//! 所有变更在同一事务内写入同步操作日志（sync_outbox），
+//! 并更新记录行的版本（v_lamport/v_device）供跨设备合并。
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::db::outbox;
 use crate::error::AppResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,18 +68,36 @@ pub fn create(conn: &Connection, doc: &Document) -> AppResult<Document> {
         updated_at: now,
         ..doc.clone()
     };
-    conn.execute(
-        "INSERT INTO documents (id, title, file_name, file_path, size, mime, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    let tx = conn.unchecked_transaction()?;
+    let op = outbox::record(&tx, "document", "upsert", &doc.id, &serde_json::to_string(&doc)?)?;
+    tx.execute(
+        "INSERT INTO documents (id, title, file_name, file_path, size, mime, created_at, updated_at, v_lamport, v_device)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         (
             &doc.id, &doc.title, &doc.file_name, &doc.file_path,
             doc.size, &doc.mime, &doc.created_at, &doc.updated_at,
+            op.lamport, &op.device_id,
         ),
     )?;
+    tx.commit()?;
     Ok(doc)
 }
 
-pub fn delete(conn: &Connection, id: &str) -> AppResult<()> {
-    conn.execute("DELETE FROM documents WHERE id = ?1", (id,))?;
-    Ok(())
+pub fn delete(conn: &Connection, id: &str) -> AppResult<Option<String>> {
+    let tx = conn.unchecked_transaction()?;
+    // 删除操作的 data 携带 filePath，供其他设备清理 vault 文件本体
+    let file_path: Option<String> = tx
+        .query_row(
+            "SELECT file_path FROM documents WHERE id = ?1",
+            (id,),
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(fp) = &file_path {
+        let data = serde_json::json!({ "filePath": fp }).to_string();
+        outbox::record(&tx, "document", "delete", id, &data)?;
+        tx.execute("DELETE FROM documents WHERE id = ?1", (id,))?;
+    }
+    tx.commit()?;
+    Ok(file_path)
 }

@@ -1,9 +1,15 @@
-//! GitHub 云同步：内嵌 git2 推送/拉取加密快照，Token 存 Windows 凭据管理器
+//! GitHub 云同步：内嵌 git2 推送/拉取加密增量操作日志，Token 存 Windows 凭据管理器
 //!
-//! 同步内容 = 一份用主密钥加密的整体快照（笔记 + 账号密文 + 资料元数据）
-//!           + vault 目录中的加密文件本体。仓库中不存在任何明文数据。
+//! 同步内容 = 一份加密的「增量操作日志」（ops/*.op，每条操作含 Lamport 时钟 + 设备 ID，
+//! 跨设备按 (lamport, device_id) 全局排序回放，每记录 last-write-wins 自动合并，
+//! 删除以墓碑形式传播，不会互相覆盖或复活）+ vault 目录中的加密文件本体。
+//! 仓库中不存在任何明文数据。
+//!
+//! 快照（snapshot.v + notes/*.json 等）仅用于「压缩」：ops 过多时把合并后的当前状态
+//! 落成快照并清空日志，避免日志无限增长；同时兼容导入旧版快照。
 
 use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -12,19 +18,27 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto;
-use crate::db::{accounts, documents, meta, notes};
+use crate::db::{accounts, documents, groups, meta, notes, outbox};
+use crate::db::outbox::SyncOp;
 use crate::error::{AppError, AppResult};
-use crate::state::AppState;
+use crate::state::{AppState, SyncStatus};
 
 pub const KEYRING_SERVICE: &str = "com.zouni.uunote";
 pub const KEYRING_TOKEN_USER: &str = "github_token";
 
-/// 快照文件名（位于仓库根目录，始终加密）
-const SNAPSHOT_FILE: &str = "snapshot.enc";
 /// 快照公开盐文件：明文 base64(salt)，随快照一起推送。
 /// 任何设备用「主密码 + 该盐」即可派生同一密钥解密快照（跨设备可恢复）。
 const SNAPSHOT_SALT_FILE: &str = "snapshot.salt";
+/// 旧版整体快照文件名（兼容已推送到仓库的旧数据）
+const SNAPSHOT_FILE: &str = "snapshot.enc";
+/// 快照版本文件：压缩时写入当时的最大 Lamport，导入时作为合并基线
+const SNAPSHOT_VERSION_FILE: &str = "snapshot.v";
 const VAULT_SUBDIR: &str = "vault";
+const OPS_SUBDIR: &str = "ops";
+/// ops 文件达到该数量后触发压缩（落快照 + 清空日志）
+const COMPACT_THRESHOLD: usize = 200;
+/// 单个 .op 文件最多打包的操作数
+const OP_BATCH_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,18 +50,8 @@ pub struct SyncConfig {
     pub last_sync_at: Option<String>,
     /// Token 是否已保存到系统凭据管理器（不回显明文）
     pub has_token: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Snapshot {
-    version: u32,
-    exported_at: String,
-    notes: Vec<notes::Note>,
-    accounts: Vec<accounts::Account>,
-    documents: Vec<documents::Document>,
-    /// 解锁所需的最小 meta 子集（盐、魔术串）
-    salt: Option<String>,
-    magic: Option<String>,
+    /// 自动同步开关
+    pub auto_sync: bool,
 }
 
 // ---------- Token / 配置 ----------
@@ -96,6 +100,9 @@ pub fn get_config(conn: &Connection) -> AppResult<Option<SyncConfig>> {
     let branch = meta::get(conn, "sync.branch")?.unwrap_or_else(|| "main".into());
     let git_proxy = meta::get(conn, "sync.git_proxy")?;
     let last_sync_at = meta::get(conn, "sync.last_sync_at")?;
+    let auto_sync = meta::get(conn, "sync.auto")?
+        .map(|v| v != "false")
+        .unwrap_or(true);
     let has_token = get_token()?.is_some();
     Ok(Some(SyncConfig {
         repo_url,
@@ -103,6 +110,7 @@ pub fn get_config(conn: &Connection) -> AppResult<Option<SyncConfig>> {
         git_proxy,
         last_sync_at,
         has_token,
+        auto_sync,
     }))
 }
 
@@ -287,15 +295,7 @@ fn working_tree_clean(repo: &Repository) -> bool {
     repo.statuses(None).map(|s| s.is_empty()).unwrap_or(false)
 }
 
-// ---------- 快照导出 / 导入 ----------
-//
-// 同步内容按「每记录一个加密文件」组织，未变化的文件 git 天然增量：
-//   snapshot.salt  —— 快照公开盐（明文 base64，跨设备用主密码派生同一密钥）
-//   notes/*.json   —— 每个笔记一个加密文件
-//   accounts/*.json—— 每个账号一个加密文件
-//   documents/*.json—— 每个资料一条加密元数据
-//   vault/         —— 加密文件本体
-// 旧版整体快照 snapshot.enc 仅用于导入兼容，导出时删除。
+// ---------- 快照盐 / 密钥 ----------
 
 /// 生成解密/加密快照文件的密钥：
 /// 优先用「快照公开盐 + 内存中的主密码」派生（跨设备可复现）；
@@ -325,6 +325,278 @@ fn ensure_snapshot_salt(state: &AppState) -> AppResult<()> {
     fs::write(&salt_path, salt)?;
     Ok(())
 }
+
+// ---------- 增量操作日志（ops/*.op） ----------
+
+fn ops_dir(sync_dir: &std::path::Path) -> PathBuf {
+    sync_dir.join(OPS_SUBDIR)
+}
+
+/// 把一批操作写入一个新 .op 文件（整体加密）。
+/// 文件名取首操作的 lamport-设备前缀，跨设备全局唯一（lamport 每设备单调递增）。
+fn write_op_batch(sync_dir: &std::path::Path, ops: &[SyncOp], key: &[u8; crypto::KEY_LEN]) -> AppResult<String> {
+    if ops.is_empty() {
+        return Ok(String::new());
+    }
+    let dir = ops_dir(sync_dir);
+    fs::create_dir_all(&dir)?;
+    let first = &ops[0];
+    let name = format!(
+        "{}-{}.op",
+        first.lamport,
+        &first.device_id[..first.device_id.len().min(8)]
+    );
+    let json = serde_json::to_vec(ops)?;
+    let enc = crypto::encrypt(key, &json)?;
+    fs::write(dir.join(&name), enc)?;
+    Ok(name)
+}
+
+/// 读取 ops/ 目录下全部操作并按 (lamport, device_id) 全局排序
+fn read_all_ops(sync_dir: &std::path::Path, key: &[u8; crypto::KEY_LEN]) -> AppResult<Vec<SyncOp>> {
+    let dir = ops_dir(sync_dir);
+    let mut ops = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("op") {
+                continue;
+            }
+            let enc = fs::read(entry.path())?;
+            let json = crypto::decrypt(key, &enc)?;
+            let batch: Vec<SyncOp> = serde_json::from_slice(&json)?;
+            ops.extend(batch);
+        }
+    }
+    ops.sort_by(|a, b| (a.lamport, &a.device_id).cmp(&(b.lamport, &b.device_id)));
+    Ok(ops)
+}
+
+fn count_op_files(sync_dir: &std::path::Path) -> usize {
+    ops_dir(sync_dir)
+        .read_dir()
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("op"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+// ---------- 远端操作应用（合并） ----------
+
+/// 应用一条远端操作到本地数据库。
+/// 采用「每记录 last-write-wins」+ 墓碑 + 快照基线：
+///   - 快照基线：所有 <= 基线的操作已体现在快照中，直接忽略（防止旧操作复活已删记录）
+///   - 行版本 + 墓碑：操作须比当前行版本和墓碑都新才会生效
+fn apply_op(
+    conn: &Connection,
+    op: &SyncOp,
+    vault_dir: &std::path::Path,
+    sync_dir: &std::path::Path,
+    _key: &[u8; crypto::KEY_LEN],
+) -> AppResult<bool> {
+    let baseline = meta::get(conn, "sync.baseline")?
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    if op.lamport <= baseline {
+        return Ok(false);
+    }
+    let op_device = &op.device_id;
+    let newer_than = |cur_lp: i64, cur_dev: &str| {
+        outbox::op_is_newer(op.lamport, op_device, cur_lp, cur_dev)
+    };
+    match op.kind.as_str() {
+        "note" => {
+            let cur = outbox::row_version(conn, "notes", &op.record_id)?;
+            let tomb = outbox::tombstone(conn, "note", &op.record_id)?.unwrap_or((0, String::new()));
+            if !newer_than(cur.0, &cur.1) || !newer_than(tomb.0, &tomb.1) {
+                return Ok(false);
+            }
+            if op.op == "delete" {
+                conn.execute("DELETE FROM notes WHERE id = ?1", (&op.record_id,))?;
+                outbox::set_tombstone(conn, "note", &op.record_id, op.lamport, op_device)?;
+            } else {
+                let note: notes::Note = serde_json::from_str(&op.data)?;
+                conn.execute(
+                    "INSERT INTO notes (id, title, blocks, pinned, group_id, created_at, updated_at, v_lamport, v_device)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(id) DO UPDATE SET title = excluded.title, blocks = excluded.blocks,
+                        pinned = excluded.pinned, group_id = excluded.group_id,
+                        updated_at = excluded.updated_at,
+                        v_lamport = excluded.v_lamport, v_device = excluded.v_device",
+                    (&note.id, &note.title, &note.blocks, note.pinned as i64, &note.group_id,
+                     &note.created_at, &note.updated_at, op.lamport, op_device),
+                )?;
+                outbox::remove_tombstone(conn, "note", &op.record_id)?;
+            }
+        }
+        "group" => {
+            let cur = outbox::row_version(conn, "note_groups", &op.record_id)?;
+            let tomb = outbox::tombstone(conn, "group", &op.record_id)?.unwrap_or((0, String::new()));
+            if !newer_than(cur.0, &cur.1) || !newer_than(tomb.0, &tomb.1) {
+                return Ok(false);
+            }
+            if op.op == "delete" {
+                conn.execute("DELETE FROM note_groups WHERE id = ?1", (&op.record_id,))?;
+                outbox::set_tombstone(conn, "group", &op.record_id, op.lamport, op_device)?;
+            } else {
+                let g: groups::NoteGroup = serde_json::from_str(&op.data)?;
+                conn.execute(
+                    "INSERT INTO note_groups (id, title, created_at, updated_at, v_lamport, v_device)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at,
+                        v_lamport = excluded.v_lamport, v_device = excluded.v_device",
+                    (&g.id, &g.title, &g.created_at, &g.updated_at, op.lamport, op_device),
+                )?;
+                outbox::remove_tombstone(conn, "group", &op.record_id)?;
+            }
+        }
+        "account" => {
+            let cur = outbox::row_version(conn, "accounts", &op.record_id)?;
+            let tomb = outbox::tombstone(conn, "account", &op.record_id)?.unwrap_or((0, String::new()));
+            if !newer_than(cur.0, &cur.1) || !newer_than(tomb.0, &tomb.1) {
+                return Ok(false);
+            }
+            if op.op == "delete" {
+                conn.execute("DELETE FROM accounts WHERE id = ?1", (&op.record_id,))?;
+                outbox::set_tombstone(conn, "account", &op.record_id, op.lamport, op_device)?;
+            } else {
+                let a: accounts::Account = serde_json::from_str(&op.data)?;
+                conn.execute(
+                    "INSERT INTO accounts (id, title, username, password_enc, url, notes, created_at, updated_at, v_lamport, v_device)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     ON CONFLICT(id) DO UPDATE SET title = excluded.title, username = excluded.username,
+                        password_enc = excluded.password_enc, url = excluded.url, notes = excluded.notes,
+                        updated_at = excluded.updated_at,
+                        v_lamport = excluded.v_lamport, v_device = excluded.v_device",
+                    (&a.id, &a.title, &a.username, &a.password_enc, &a.url, &a.notes,
+                     &a.created_at, &a.updated_at, op.lamport, op_device),
+                )?;
+                outbox::remove_tombstone(conn, "account", &op.record_id)?;
+            }
+        }
+        "document" => {
+            let cur = outbox::row_version(conn, "documents", &op.record_id)?;
+            let tomb = outbox::tombstone(conn, "document", &op.record_id)?.unwrap_or((0, String::new()));
+            if !newer_than(cur.0, &cur.1) || !newer_than(tomb.0, &tomb.1) {
+                return Ok(false);
+            }
+            if op.op == "delete" {
+                conn.execute("DELETE FROM documents WHERE id = ?1", (&op.record_id,))?;
+                // 删除操作 data 携带 {"filePath": "..."}，清理本地 vault 文件本体
+                if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&op.data) {
+                    if let Some(fp) = payload.get("filePath").and_then(|v| v.as_str()) {
+                        let _ = fs::remove_file(vault_dir.join(fp));
+                    }
+                }
+                outbox::set_tombstone(conn, "document", &op.record_id, op.lamport, op_device)?;
+            } else {
+                let doc: documents::Document = serde_json::from_str(&op.data)?;
+                conn.execute(
+                    "INSERT INTO documents (id, title, file_name, file_path, size, mime, created_at, updated_at, v_lamport, v_device)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     ON CONFLICT(id) DO UPDATE SET title = excluded.title, file_name = excluded.file_name,
+                        file_path = excluded.file_path, size = excluded.size, mime = excluded.mime,
+                        updated_at = excluded.updated_at,
+                        v_lamport = excluded.v_lamport, v_device = excluded.v_device",
+                    (&doc.id, &doc.title, &doc.file_name, &doc.file_path, doc.size, &doc.mime,
+                     &doc.created_at, &doc.updated_at, op.lamport, op_device),
+                )?;
+                // 恢复加密文件本体（仅缺失时复制，blob 内容按 file_path 不可变）
+                let src = sync_dir.join(VAULT_SUBDIR).join(&doc.file_path);
+                if src.exists() {
+                    let dst = vault_dir.join(&doc.file_path);
+                    if !dst.exists() {
+                        fs::create_dir_all(dst.parent().unwrap_or(vault_dir))?;
+                        fs::copy(&src, &dst)?;
+                    }
+                }
+                outbox::remove_tombstone(conn, "document", &op.record_id)?;
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// 合并远端数据到本地（拉取 / 推送前都会调用）：
+/// 有 ops/ → 回放增量；否则有快照 → 导入快照（含基线）；再否则兼容旧版整体快照。
+/// 返回是否应用了任何远端变更（供前端刷新与状态提示）。
+fn merge_remote(state: &AppState, key: &[u8; crypto::KEY_LEN]) -> AppResult<usize> {
+    let sync_dir = state.sync_dir.lock().unwrap().clone();
+    let vault_dir = state.vault_dir.lock().unwrap().clone();
+
+    if count_op_files(&sync_dir) > 0 {
+        let ops = read_all_ops(&sync_dir, key)?;
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        let mut applied = 0usize;
+        {
+            let conn = state.db.lock().unwrap();
+            let tx = conn.unchecked_transaction()?;
+            for op in &ops {
+                if apply_op(&tx, op, &vault_dir, &sync_dir, key)? {
+                    applied += 1;
+                }
+            }
+            let max_lp = ops.iter().map(|o| o.lamport).max().unwrap_or(0);
+            outbox::bump_lamport(&tx, max_lp)?;
+            tx.commit()?;
+        }
+        if applied > 0 {
+            emit_changed(state);
+        }
+        return Ok(applied);
+    }
+
+    let has_snapshot = sync_dir.join("notes").exists()
+        || sync_dir.join("accounts").exists()
+        || sync_dir.join("documents").exists()
+        || sync_dir.join(SNAPSHOT_VERSION_FILE).exists();
+    if has_snapshot {
+        import_snapshot(state, key)?;
+        emit_changed(state);
+        return Ok(1);
+    }
+
+    // 旧版整体快照（snapshot.enc）：全量导入
+    let enc_path = sync_dir.join(SNAPSHOT_FILE);
+    if enc_path.exists() {
+        import_snapshot_legacy(state, &enc_path, key)?;
+        emit_changed(state);
+        return Ok(1);
+    }
+    Ok(0)
+}
+
+/// 通知前端数据已变化（远端合并后各页面应重新拉取）
+fn emit_changed(state: &AppState) {
+    use tauri::Emitter;
+    let app = state.app_handle.lock().unwrap().clone();
+    if let Some(app) = app {
+        let _ = app.emit("sync://changed", ());
+    }
+}
+
+/// 更新内存与前端同步状态
+pub fn emit_status(state: &AppState, status: &str, message: impl Into<String>) {
+    let message = message.into();
+    *state.sync_status.lock().unwrap() = SyncStatus {
+        state: status.to_string(),
+        message: message.clone(),
+    };
+    use tauri::Emitter;
+    let app = state.app_handle.lock().unwrap().clone();
+    if let Some(app) = app {
+        let _ = app.emit("sync://status", SyncStatus {
+            state: status.to_string(),
+            message,
+        });
+    }
+}
+
+// ---------- 快照（压缩 / 导入） ----------
 
 /// 把一批记录各写成一个加密 JSON 文件，并清理已删除记录的残留文件
 fn write_records<T: Serialize>(
@@ -377,28 +649,34 @@ fn read_records<T: serde::de::DeserializeOwned>(
     Ok(items)
 }
 
-pub fn export_snapshot(state: &AppState) -> AppResult<()> {
+/// 压缩：把合并后的当前状态落成快照（每记录一个加密文件 + snapshot.v 版本号），
+/// 删除 ops/ 目录并清空 outbox（快照已代表全部变更）。
+/// 返回快照版本号（合并基线）。
+fn compact_to_snapshot(state: &AppState, key: &[u8; crypto::KEY_LEN]) -> AppResult<i64> {
     ensure_snapshot_salt(state)?;
     let sync_dir = state.sync_dir.lock().unwrap().clone();
     let vault_dir = state.vault_dir.lock().unwrap().clone();
-    let conn = state.db.lock().unwrap();
-    let key = snapshot_key(state, &sync_dir)?;
 
-    let notes = notes::list(&conn)?;
-    let accounts = accounts::list(&conn)?;
-    let documents = documents::list(&conn)?;
+    let (notes_list, groups_list, accounts_list, documents_list, max_lp) = {
+        let conn = state.db.lock().unwrap();
+        let notes_list = notes::list(&conn)?;
+        let groups_list = groups::list(&conn)?;
+        let accounts_list = accounts::list(&conn)?;
+        let documents_list = documents::list(&conn)?;
+        let max_lp = outbox::max_lamport(&conn)?.max(outbox::current_lamport(&conn)?);
+        (notes_list, groups_list, accounts_list, documents_list, max_lp)
+    };
 
-    write_records(&sync_dir, "notes", &notes, |n| &n.id, &key)?;
-    write_records(&sync_dir, "accounts", &accounts, |a| &a.id, &key)?;
-    write_records(&sync_dir, "documents", &documents, |d| &d.id, &key)?;
-
-    // 旧版整体快照：迁移到新架构后不再生成，删除之
-    let _ = fs::remove_file(sync_dir.join(SNAPSHOT_FILE));
+    write_records(&sync_dir, "notes", &notes_list, |n| &n.id, key)?;
+    write_records(&sync_dir, "groups", &groups_list, |g| &g.id, key)?;
+    write_records(&sync_dir, "accounts", &accounts_list, |a| &a.id, key)?;
+    write_records(&sync_dir, "documents", &documents_list, |d| &d.id, key)?;
+    fs::write(sync_dir.join(SNAPSHOT_VERSION_FILE), max_lp.to_string())?;
 
     // 同步加密文件本体
     let vault_dst = sync_dir.join(VAULT_SUBDIR);
     fs::create_dir_all(&vault_dst)?;
-    for doc in &documents {
+    for doc in &documents_list {
         let src = vault_dir.join(&doc.file_path);
         let dst = vault_dst.join(&doc.file_path);
         if src.exists() {
@@ -406,59 +684,71 @@ pub fn export_snapshot(state: &AppState) -> AppResult<()> {
             fs::copy(&src, &dst)?;
         }
     }
-    // 清理仓库中已删除资料的残留文件
-    for entry in fs::read_dir(&vault_dst)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let still_exists = documents.iter().any(|d| d.file_path == name);
-        if !still_exists {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
-    Ok(())
+
+    // 日志已并入快照：删除 ops 目录，清空 outbox
+    let _ = fs::remove_dir_all(ops_dir(&sync_dir));
+    let conn = state.db.lock().unwrap();
+    outbox::clear(&conn)?;
+    Ok(max_lp)
 }
 
-pub fn import_snapshot(state: &AppState) -> AppResult<()> {
+/// 快照导入：全量替换本地数据（仅在远端压缩落快照 / 旧版仓库时触发），
+/// 记录版本统一设为快照基线 N，之后把本地未推送操作按 LWW 重新套用上去。
+fn import_snapshot(state: &AppState, key: &[u8; crypto::KEY_LEN]) -> AppResult<()> {
     let sync_dir = state.sync_dir.lock().unwrap().clone();
     let vault_dir = state.vault_dir.lock().unwrap().clone();
-    let key = snapshot_key(state, &sync_dir)?;
 
-    // 旧版整体快照（snapshot.enc）：走全量导入
-    let enc_path = sync_dir.join(SNAPSHOT_FILE);
-    if enc_path.exists() {
-        return import_snapshot_legacy(state, &enc_path, &key);
-    }
+    let baseline: i64 = fs::read_to_string(sync_dir.join(SNAPSHOT_VERSION_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
 
-    // 新版：每记录一个加密文件
-    let notes: Vec<notes::Note> = read_records(&sync_dir, "notes", &key)?;
-    let accounts: Vec<accounts::Account> = read_records(&sync_dir, "accounts", &key)?;
-    let documents: Vec<documents::Document> = read_records(&sync_dir, "documents", &key)?;
+    let notes_list: Vec<notes::Note> = read_records(&sync_dir, "notes", key)?;
+    let groups_list: Vec<groups::NoteGroup> = read_records(&sync_dir, "groups", key)?;
+    let accounts_list: Vec<accounts::Account> = read_records(&sync_dir, "accounts", key)?;
+    let documents_list: Vec<documents::Document> = read_records(&sync_dir, "documents", key)?;
 
     let conn = state.db.lock().unwrap();
     let tx = conn.unchecked_transaction()?;
-    tx.execute_batch("DELETE FROM notes; DELETE FROM accounts; DELETE FROM documents;")?;
-    for n in &notes {
+    tx.execute_batch(
+        "DELETE FROM notes; DELETE FROM note_groups; DELETE FROM accounts; DELETE FROM documents;",
+    )?;
+    outbox::clear_tombstones(&tx)?;
+    for g in &groups_list {
         tx.execute(
-            "INSERT INTO notes (id, title, blocks, pinned, created_at, updated_at)
+            "INSERT INTO note_groups (id, title, created_at, updated_at, v_lamport, v_device)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (&g.id, &g.title, &g.created_at, &g.updated_at, baseline, ""),
+        )?;
+    }
+    for n in &notes_list {
+        tx.execute(
+            "INSERT INTO notes (id, title, blocks, pinned, group_id, created_at, updated_at, v_lamport, v_device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             (
-                &n.id, &n.title, &n.blocks,
-                n.pinned as i64, &n.created_at, &n.updated_at,
+                &n.id, &n.title, &n.blocks, n.pinned as i64, &n.group_id,
+                &n.created_at, &n.updated_at, baseline, "",
             ),
         )?;
     }
-    for a in &accounts {
+    for a in &accounts_list {
         tx.execute(
-            "INSERT INTO accounts (id, title, username, password_enc, url, notes, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            (&a.id, &a.title, &a.username, &a.password_enc, &a.url, &a.notes, &a.created_at, &a.updated_at),
+            "INSERT INTO accounts (id, title, username, password_enc, url, notes, created_at, updated_at, v_lamport, v_device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (
+                &a.id, &a.title, &a.username, &a.password_enc, &a.url, &a.notes,
+                &a.created_at, &a.updated_at, baseline, "",
+            ),
         )?;
     }
-    for d in &documents {
+    for d in &documents_list {
         tx.execute(
-            "INSERT INTO documents (id, title, file_name, file_path, size, mime, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            (&d.id, &d.title, &d.file_name, &d.file_path, d.size, &d.mime, &d.created_at, &d.updated_at),
+            "INSERT INTO documents (id, title, file_name, file_path, size, mime, created_at, updated_at, v_lamport, v_device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (
+                &d.id, &d.title, &d.file_name, &d.file_path, d.size, &d.mime,
+                &d.created_at, &d.updated_at, baseline, "",
+            ),
         )?;
         // 恢复加密文件本体
         let src = sync_dir.join(VAULT_SUBDIR).join(&d.file_path);
@@ -468,14 +758,17 @@ pub fn import_snapshot(state: &AppState) -> AppResult<()> {
             fs::copy(&src, &dst)?;
         }
     }
+    // 快照版本即合并基线：<= 基线的操作全部体现在快照中
+    meta::set(&tx, "sync.baseline", &baseline.to_string())?;
+    outbox::bump_lamport(&tx, baseline)?;
+    tx.commit()?;
 
-    // 解锁信息切换到快照密钥体系：跨设备后本地也能用相同主密码解锁并解密数据
-    let salt_path = sync_dir.join(SNAPSHOT_SALT_FILE);
-    if let Ok(salt_b64) = fs::read_to_string(&salt_path) {
-        let salt_b64 = salt_b64.trim().to_string();
-        meta::set(&tx, "salt", &salt_b64)?;
-        meta::set(&tx, "master_magic", &crypto::encrypt_magic(&key)?)?;
-        state.set_master_key(key);
+    // 本地未推送操作重新套用到快照之上（LWW：> 基线的生效，<= 基线的被快照覆盖）
+    // 复用已持有的 conn 锁（std Mutex 不可重入，不能再锁一次）
+    let pend = outbox::pending(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    for (_, op) in &pend {
+        apply_op(&tx, op, &vault_dir, &sync_dir, key)?;
     }
     tx.commit()?;
     Ok(())
@@ -491,33 +784,49 @@ fn import_snapshot_legacy(
     let vault_dir = state.vault_dir.lock().unwrap().clone();
     let encrypted = fs::read(enc_path)?;
     let json = crypto::decrypt(key, &encrypted)?;
+    #[derive(Deserialize)]
+    struct Snapshot {
+        notes: Vec<notes::Note>,
+        accounts: Vec<accounts::Account>,
+        documents: Vec<documents::Document>,
+        #[serde(default)]
+        salt: Option<String>,
+        #[serde(default)]
+        magic: Option<String>,
+    }
     let snapshot: Snapshot = serde_json::from_slice(&json)?;
 
     let conn = state.db.lock().unwrap();
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch("DELETE FROM notes; DELETE FROM accounts; DELETE FROM documents;")?;
+    outbox::clear_tombstones(&tx)?;
     for n in &snapshot.notes {
         tx.execute(
-            "INSERT INTO notes (id, title, blocks, pinned, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO notes (id, title, blocks, pinned, created_at, updated_at, v_lamport, v_device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, '')",
             (
-                &n.id, &n.title, &n.blocks,
-                n.pinned as i64, &n.created_at, &n.updated_at,
+                &n.id, &n.title, &n.blocks, n.pinned as i64, &n.created_at, &n.updated_at,
             ),
         )?;
     }
     for a in &snapshot.accounts {
         tx.execute(
-            "INSERT INTO accounts (id, title, username, password_enc, url, notes, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            (&a.id, &a.title, &a.username, &a.password_enc, &a.url, &a.notes, &a.created_at, &a.updated_at),
+            "INSERT INTO accounts (id, title, username, password_enc, url, notes, created_at, updated_at, v_lamport, v_device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, '')",
+            (
+                &a.id, &a.title, &a.username, &a.password_enc, &a.url, &a.notes,
+                &a.created_at, &a.updated_at,
+            ),
         )?;
     }
     for d in &snapshot.documents {
         tx.execute(
-            "INSERT INTO documents (id, title, file_name, file_path, size, mime, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            (&d.id, &d.title, &d.file_name, &d.file_path, d.size, &d.mime, &d.created_at, &d.updated_at),
+            "INSERT INTO documents (id, title, file_name, file_path, size, mime, created_at, updated_at, v_lamport, v_device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, '')",
+            (
+                &d.id, &d.title, &d.file_name, &d.file_path, d.size, &d.mime,
+                &d.created_at, &d.updated_at,
+            ),
         )?;
         let src = sync_dir.join(VAULT_SUBDIR).join(&d.file_path);
         if src.exists() {
@@ -533,16 +842,24 @@ fn import_snapshot_legacy(
     if let Some(magic) = &snapshot.magic {
         meta::set(&tx, "master_magic", magic)?;
     }
+    meta::set(&tx, "sync.baseline", "0")?;
     tx.commit()?;
     state.set_master_key(*key);
+
+    // 本地未推送操作重新套用（复用已持有的 conn 锁）
+    let pend = outbox::pending(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    for (_, op) in &pend {
+        apply_op(&tx, op, &vault_dir, &sync_dir, key)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
-// ---------- 自动提交 ----------
+// ---------- 自动提交 / 后台同步 ----------
 
-/// 笔记等数据变更后调用：后台自动提交并推送。
-/// 未配置仓库 / 未解锁 / 未保存 Token 时静默跳过，不打断用户操作。
-/// 后台串行执行（push_lock），避免并发推送互相冲突。
+/// 数据变更后调用：标记待推送并在后台串行同步（静默，不打断用户操作）。
+/// 未配置仓库 / 未解锁 / 未保存 Token 时静默跳过。
 pub fn auto_commit(state: Arc<AppState>) {
     if state.is_locked() || state.repo_url.lock().unwrap().is_empty() {
         return;
@@ -551,9 +868,10 @@ pub fn auto_commit(state: Arc<AppState>) {
         return;
     }
     *state.auto_push_pending.lock().unwrap() = true;
+    emit_status(&state, "pending", "有变更待同步…");
     let st = state.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        // 串行化：同一时间只允许一个推送线程执行
+        // 串行化：同一时间只允许一个同步线程执行
         let _guard = st.push_lock.lock();
         loop {
             let more = {
@@ -569,12 +887,75 @@ pub fn auto_commit(state: Arc<AppState>) {
                 return;
             }
             // 失败静默：不影响用户操作，下次变更或退出时兜底重试
-            let _ = push(&st);
+            if push(&st).is_ok() {
+                emit_status(&st, "synced", "已同步");
+            } else {
+                emit_status(&st, "error", "同步失败，将在下次变更时重试");
+            }
         }
     });
 }
 
-// ---------- push / pull ----------
+/// 解锁后启动后台自动同步循环：
+/// 有本地变更立即同步；空闲时每 30 秒检查一次，距上次同步超过 2 分钟则定期同步。
+pub fn start_background_sync(state: Arc<AppState>) {
+    if state.is_locked() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut first = true;
+        loop {
+            if state.is_locked() {
+                return;
+            }
+            if !state.repo_url.lock().unwrap().is_empty()
+                && *state.sync_auto.lock().unwrap()
+            {
+                let should_sync = first
+                    || {
+                        let pending = {
+                            let conn = state.db.lock().unwrap();
+                            outbox::pending(&conn)
+                                .map(|p| !p.is_empty())
+                                .unwrap_or(false)
+                        };
+                        if pending {
+                            true
+                        } else {
+                            // 距上次同步超过 2 分钟则定期同步
+                            let last = meta::get(&state.db.lock().unwrap(), "sync.last_sync_at")
+                                .ok()
+                                .flatten();
+                            match last.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok()) {
+                                Some(t) => {
+                                    (chrono::Utc::now().timestamp()
+                                        - t.with_timezone(&chrono::Utc).timestamp())
+                                        >= 120
+                                }
+                                None => true,
+                            }
+                        }
+                    };
+                if should_sync {
+                    emit_status(&state, "syncing", "正在同步…");
+                    let _guard = state.push_lock.lock();
+                    // 等待锁期间可能已被锁定
+                    if state.is_locked() {
+                        return;
+                    }
+                    match push(&state) {
+                        Ok(msg) => emit_status(&state, "synced", msg),
+                        Err(e) => emit_status(&state, "error", format!("同步失败：{e}")),
+                    }
+                }
+            }
+            first = false;
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    });
+}
+
+// ---------- push / pull / auto ----------
 
 pub fn push(state: &AppState) -> AppResult<String> {
     if state.repo_url.lock().unwrap().is_empty() {
@@ -592,13 +973,66 @@ pub fn push(state: &AppState) -> AppResult<String> {
     let proxy = effective_proxy(&state.git_proxy.lock().unwrap());
     fetch_and_ff(&repo, &token, &branch, &proxy)?;
 
-    // 数据安全：推送覆盖前必须验证本地密钥能解开远端快照。
+    // 数据安全：推送覆盖前必须验证本地密钥能解开远端快照/操作日志。
     // 若密钥不匹配（密码/数据目录与当初不同），推送会把远端有效数据静默覆盖，
     // 因此这里直接中止，避免误用错误密码毁掉旧数据。
     verify_remote_snapshot(state)?;
 
-    // 生成加密快照（含 vault 文件），再提交推送
-    export_snapshot(state)?;
+    let key = snapshot_key(state, &state.sync_dir.lock().unwrap())?;
+
+    // 先合并远端增量到本地（增量回放 / 快照导入），保证推送的是合并后的状态
+    let merged = merge_remote(state, &key)?;
+
+    let sync_dir = state.sync_dir.lock().unwrap().clone();
+    let vault_dir = state.vault_dir.lock().unwrap().clone();
+
+    // 收集本地未推送操作：同步 vault 文件本体 → 分批写入 .op 文件
+    let pending_ids: Vec<i64> = {
+        let conn = state.db.lock().unwrap();
+        let pend = outbox::pending(&conn)?;
+        if pend.is_empty() {
+            Vec::new()
+        } else {
+            for (_, op) in &pend {
+                if op.kind == "document" {
+                    if op.op == "upsert" {
+                        // 新资料的加密文件本体一并推送到仓库
+                        if let Ok(doc) = serde_json::from_str::<documents::Document>(&op.data) {
+                            let src = vault_dir.join(&doc.file_path);
+                            let dst = sync_dir.join(VAULT_SUBDIR).join(&doc.file_path);
+                            if src.exists() {
+                                fs::create_dir_all(dst.parent().unwrap_or(&sync_dir.join(VAULT_SUBDIR)))?;
+                                fs::copy(&src, &dst)?;
+                            }
+                        }
+                    } else if let Ok(payload) =
+                        serde_json::from_str::<serde_json::Value>(&op.data)
+                    {
+                        // 删除资料：清理仓库中的残留文件本体
+                        if let Some(fp) = payload.get("filePath").and_then(|v| v.as_str()) {
+                            let _ = fs::remove_file(sync_dir.join(VAULT_SUBDIR).join(fp));
+                        }
+                    }
+                }
+            }
+            let ops: Vec<SyncOp> = pend.iter().map(|(_, op)| op.clone()).collect();
+            for chunk in ops.chunks(OP_BATCH_SIZE) {
+                write_op_batch(&sync_dir, chunk, &key)?;
+            }
+            pend.iter().map(|(id, _)| *id).collect()
+        }
+    };
+
+    // ops 文件过多时压缩落快照并清空日志；否则仅标记已推送
+    if count_op_files(&sync_dir) >= COMPACT_THRESHOLD {
+        compact_to_snapshot(state, &key)?;
+    } else if !pending_ids.is_empty() {
+        let conn = state.db.lock().unwrap();
+        outbox::mark_pushed(&conn, &pending_ids)?;
+    }
+
+    // 确保快照盐随首次推送一起上传
+    ensure_snapshot_salt(state)?;
 
     // 暂存全部变更并提交
     let mut index = repo.index()?;
@@ -633,31 +1067,45 @@ pub fn push(state: &AppState) -> AppResult<String> {
 
     let now = Utc::now().to_rfc3339();
     meta::set(&state.db.lock().unwrap(), "sync.last_sync_at", &now)?;
-    Ok(format!("推送成功（{}）", now))
+    let suffix = if merged > 0 {
+        format!("，合并了 {merged} 条远端变更")
+    } else {
+        String::new()
+    };
+    Ok(format!("已同步{suffix}（{}）", now))
 }
 
-/// 推送前校验：远端快照能否用本地密钥（快照公开盐 + 主密码）解密。
+/// 推送前校验：远端快照/操作日志能否用本地密钥（快照公开盐 + 主密码）解密。
 /// 无法解密则中止推送，防止误用错误密钥/数据目录覆盖远端有效数据。
 fn verify_remote_snapshot(state: &AppState) -> AppResult<()> {
     let sync_dir = state.sync_dir.lock().unwrap().clone();
     let key = snapshot_key(state, &sync_dir)?;
+    let mismatch = || {
+        AppError::sync(
+            "本地密钥与远端数据不匹配，已中止同步（防止覆盖远端已有数据）。\
+             请确认当前使用的是当初加密该数据的主密码；\
+             若确认要放弃远端旧数据、以本地数据为准，请先在 GitHub 上手动备份或删除该仓库内容后再操作。",
+        )
+    };
 
-    // 旧版整体快照
-    let enc_path = sync_dir.join(SNAPSHOT_FILE);
-    if enc_path.exists() {
-        let encrypted = fs::read(&enc_path)?;
-        if crypto::decrypt(&key, &encrypted).is_err() {
-            return Err(AppError::sync(
-                "本地密钥与远端快照不匹配，已中止推送（防止覆盖远端已有数据）。\
-                 请确认当前使用的是当初加密该快照的主密码；\
-                 若确认要放弃远端旧数据、以本地数据为准，请先在 GitHub 上手动备份或删除该快照后再操作。",
-            ));
+    // 新版：尝试解密 ops/ 中最新文件
+    let ops = ops_dir(&sync_dir);
+    if let Ok(entries) = fs::read_dir(&ops) {
+        let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        if !files.is_empty() {
+            files.sort();
+            if let Some(last) = files.last() {
+                let enc = fs::read(last)?;
+                if crypto::decrypt(&key, &enc).is_err() {
+                    return Err(mismatch());
+                }
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
-    // 新版：尝试解密任意一个数据文件来验证密钥匹配
-    for sub in ["notes", "accounts", "documents"] {
+    // 快照记录文件
+    for sub in ["notes", "accounts", "documents", "groups"] {
         let dir = sync_dir.join(sub);
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -666,17 +1114,22 @@ fn verify_remote_snapshot(state: &AppState) -> AppResult<()> {
                 }
                 let enc = fs::read(entry.path())?;
                 if crypto::decrypt(&key, &enc).is_err() {
-                    return Err(AppError::sync(
-                        "本地密钥与远端快照不匹配，已中止推送（防止覆盖远端已有数据）。\
-                         请确认当前使用的是当初加密该快照的主密码；\
-                         若确认要放弃远端旧数据、以本地数据为准，请先在 GitHub 上手动备份或删除该快照后再操作。",
-                    ));
+                    return Err(mismatch());
                 }
                 return Ok(());
             }
         }
     }
-    // 无任何数据文件（远端为空仓库）：无历史数据，允许首次推送
+
+    // 旧版整体快照
+    let enc_path = sync_dir.join(SNAPSHOT_FILE);
+    if enc_path.exists() {
+        let encrypted = fs::read(&enc_path)?;
+        if crypto::decrypt(&key, &encrypted).is_err() {
+            return Err(mismatch());
+        }
+    }
+    // 无任何远端数据：允许首次同步
     Ok(())
 }
 
@@ -700,35 +1153,26 @@ pub fn pull(state: &AppState) -> AppResult<String> {
         .and_then(|h| h.peel_to_commit().ok())
         .is_none()
     {
-        return Ok("远端仓库为空：暂无数据可拉取，可直接「推送」完成首次同步".to_string());
+        return Ok("远端仓库为空：暂无数据可拉取，可直接「同步」完成首次同步".to_string());
     }
 
-    // 快照可能已变化，重新导入
-    import_snapshot(state)?;
+    let key = snapshot_key(state, &state.sync_dir.lock().unwrap())?;
+    let merged = merge_remote(state, &key)?;
+
     let now = Utc::now().to_rfc3339();
     meta::set(&state.db.lock().unwrap(), "sync.last_sync_at", &now)?;
-    Ok(format!("拉取成功（{}）", now))
+    let suffix = if merged > 0 {
+        format!("，合并了 {merged} 条远端变更")
+    } else {
+        String::new()
+    };
+    Ok(format!("已拉取{suffix}（{}）", now))
 }
 
-/// 自动同步（保存配置后调用）：远端为空仓库 → 自动初始化并推送；
-/// 远端已有内容 → 自动拉取。实现「保存即同步」。
+/// 自动同步（保存配置 / 解锁后调用）：远端为空仓库 → 自动初始化并推送；
+/// 远端已有内容 → 自动拉取 + 推送本地增量。实现「保存即同步」。
 pub fn auto_sync(state: &AppState) -> AppResult<String> {
-    if state.repo_url.lock().unwrap().is_empty() {
-        return Err(AppError::sync("尚未配置同步仓库"));
-    }
-    let token = get_token()?.ok_or_else(|| AppError::sync("尚未保存 GitHub Token"))?;
-
-    // 打开或初始化本地仓库（远端为空时本地初始化，等待首次推送）
-    open_or_clone_repo(state, &token)?;
-
-    let repo_url = state.repo_url.lock().unwrap().clone();
-    let proxy = effective_proxy(&state.git_proxy.lock().unwrap());
-
-    if remote_is_empty(&proxy, &token, &repo_url) {
-        push(state)
-    } else {
-        pull(state)
-    }
+    push(state)
 }
 
 /// fetch 远端并尽量快进合并到本地分支
@@ -795,7 +1239,7 @@ fn fetch_and_ff(repo: &Repository, token: &str, branch: &str, proxy: &str) -> Ap
     } else if analysis.0.is_up_to_date() {
         // 已是最新
     } else {
-        // 分叉：本地快照整体覆盖，直接 reset 到远端（单用户场景可接受）
+        // 分叉：增量日志架构下以合并回放为准，本地重置到远端后由 merge_remote 应用
         let obj = repo.find_object(fetch_commit.id(), None)?;
         repo.reset(&obj, ResetType::Hard, None)?;
     }

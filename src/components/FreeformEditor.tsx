@@ -28,6 +28,21 @@ const TEXT_COLORS = [
   "#ca8a04", "#16a34a", "#2563eb", "#7c3aed",
 ];
 
+/** 画笔可选的墨色 / 粗细（OneNote 式手写选项） */
+const DRAW_COLORS = ["#1e293b", "#dc2626", "#2563eb", "#16a34a", "#ca8a04", "#9333ea"];
+const DRAW_WIDTHS = [1.5, 2.5, 4, 6];
+
+/** 标题级别对应的字号（px） */
+const HEADING_SIZES: Record<number, number> = { 1: 28, 2: 22, 3: 18 };
+/** 行高档位 */
+const LINE_HEIGHTS = [1.2, 1.5, 1.8, 2.2];
+/** 文字高亮（底色）可选色 */
+const HIGHLIGHT_COLORS = ["#fde047", "#86efac", "#93c5fd", "#f9a8d4", "#fdba74", "#fca5a5"];
+/** 单元格底色可选色 */
+const CELL_BG_COLORS = ["#eff6ff", "#ecfdf5", "#fefce8", "#fef2f2", "#faf5ff", "#f1f5f9"];
+/** 块/表格边框可选色 */
+const BORDER_COLORS = ["#cbd5e1", "#94a3b8", "#f87171", "#60a5fa", "#4ade80", "#a78bfa"];
+
 type Mode = "select" | "text" | "draw";
 
 /** 右键菜单状态 */
@@ -111,6 +126,26 @@ export default function FreeformEditor({
     color: string;
     width: number;
   } | null>(null);
+  /** 画笔当前墨色 / 粗细 */
+  const [drawColor, setDrawColor] = useState(DRAW_COLORS[0]);
+  const [drawWidth, setDrawWidth] = useState(DRAW_WIDTHS[1]);
+  /** 撤销/重做快照栈（存"操作前"的 blocks），连续高频操作自动合并为一步 */
+  const undoStackRef = useRef<FreeformBlock[][]>([]);
+  const redoStackRef = useRef<FreeformBlock[][]>([]);
+  const lastPushRef = useRef<number | null>(null);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  /** 块级内部剪贴板（复制/粘贴块） */
+  const clipboardRef = useRef<FreeformBlock[] | null>(null);
+  /** 撤销/重做后递增，强制重建 contentEditable 块以同步数据 */
+  const [ver, setVer] = useState(0);
+  /** 文字选区浮动格式工具条 */
+  const [formatBar, setFormatBar] = useState<{
+    x: number;
+    y: number;
+    blockId: string;
+    inCell: boolean;
+  } | null>(null);
 
   const pageRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -121,6 +156,9 @@ export default function FreeformEditor({
   const focusIdRef = useRef<string | null>(null);
   /** 新表格创建后需要聚焦首格的块 id（OneNote 式：插入即可直接输入） */
   const focusTableFirstCellRef = useRef<string | null>(null);
+  /** 本次点击刚创建的文字块 id：其 mousedown 默认聚焦行为会立即触发一次 blur，
+   *  用该标记跳过对"创建中的块"的误删，pointerup 后清除 */
+  const lastCreatedRef = useRef<string | null>(null);
   const dragRef = useRef<{
     id: string;
     startX: number;
@@ -173,13 +211,61 @@ export default function FreeformEditor({
     [onSceneChange, latestJsonRef],
   );
 
-  const applyBlocks = useCallback(
+  /** 直接应用 blocks 并通知保存（不记录历史，供撤销/重做内部使用） */
+  const applyBlocksRaw = useCallback(
     (next: FreeformBlock[]) => {
+      // 同步更新 ref，避免同一事件内（如 blur 与 pointerdown 先后触发）连续操作读到旧值
+      blocksRef.current = next;
       setBlocks(next);
       emit(next);
     },
     [emit],
   );
+
+  /** 压入撤销栈：距上次操作 <600ms 视为同一操作合并（输入/拖动/缩放等高频调用不膨胀历史） */
+  const pushUndo = useCallback(() => {
+    const now = Date.now();
+    if (lastPushRef.current === null || now - lastPushRef.current >= 600) {
+      undoStackRef.current.push(blocksRef.current);
+      if (undoStackRef.current.length > 100) undoStackRef.current.shift();
+      lastPushRef.current = now;
+    }
+    redoStackRef.current = [];
+    setCanUndo(undoStackRef.current.length > 0);
+    setCanRedo(false);
+  }, []);
+
+  const applyBlocks = useCallback(
+    (next: FreeformBlock[]) => {
+      pushUndo();
+      applyBlocksRaw(next);
+    },
+    [pushUndo, applyBlocksRaw],
+  );
+
+  const undo = useCallback(() => {
+    if (undoStackRef.current.length === 0) return;
+    const prev = undoStackRef.current.pop()!;
+    redoStackRef.current.push(blocksRef.current);
+    lastPushRef.current = null;
+    setEditingId(null);
+    setVer((v) => v + 1);
+    applyBlocksRaw(prev);
+    setCanUndo(undoStackRef.current.length > 0);
+    setCanRedo(true);
+  }, [applyBlocksRaw]);
+
+  const redo = useCallback(() => {
+    if (redoStackRef.current.length === 0) return;
+    const next = redoStackRef.current.pop()!;
+    undoStackRef.current.push(blocksRef.current);
+    lastPushRef.current = null;
+    setEditingId(null);
+    setVer((v) => v + 1);
+    applyBlocksRaw(next);
+    setCanUndo(true);
+    setCanRedo(redoStackRef.current.length > 0);
+  }, [applyBlocksRaw]);
 
   /** 客户端坐标 → 画布逻辑坐标（未缩放） */
   const toPage = useCallback(
@@ -268,6 +354,8 @@ export default function FreeformEditor({
       }
     };
     const onUp = () => {
+      // 本次点击结束，刚创建块的标记失效：之后它再失焦即为真正放弃，可正常移除空框
+      lastCreatedRef.current = null;
       dragRef.current = null;
       dragGroupRef.current = null;
       dragOriginsRef.current = null;
@@ -287,9 +375,12 @@ export default function FreeformEditor({
 
   const handlePagePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
+    // 新一轮点击开始：此前创建块的标记失效（防止保护到已放弃的空框）
+    lastCreatedRef.current = null;
     const { x, y } = toPage(e.clientX, e.clientY);
     // 记住点击位置，供粘贴截图"点哪粘哪"使用
     lastClickRef.current = { x, y };
+    setFormatBar(null);
     // 空白处点击时清掉文本选区，避免残留光标把粘贴带进旧文字块（文字模式会新建块并重新聚焦）
     if (mode !== "text") window.getSelection()?.removeAllRanges();
     if (mode === "text") {
@@ -299,8 +390,8 @@ export default function FreeformEditor({
       e.currentTarget.setPointerCapture(e.pointerId);
       setActiveStroke({
         points: [[x, y]],
-        color: "#1e293b",
-        width: 2.5,
+        color: drawColor,
+        width: drawWidth,
       });
     } else {
       // 选择模式：从空白处拖出框选矩形
@@ -378,6 +469,9 @@ export default function FreeformEditor({
 
   const handlePageContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
+    setFormatBar(null);
+    // 右键视为放弃刚创建的空框
+    lastCreatedRef.current = null;
     setSelectedIds([]);
     setSelectedId(null);
     setContextMenu({ x: e.clientX, y: e.clientY, blockId: null, row: null, col: null, inlineTableId: null });
@@ -389,6 +483,9 @@ export default function FreeformEditor({
   ) => {
     e.preventDefault();
     e.stopPropagation();
+    setFormatBar(null);
+    // 右键视为放弃刚创建的空框
+    lastCreatedRef.current = null;
     // 右键命中的块不在当前多选中时，单独选中它
     if (!selectedIds.includes(block.id)) selectSingle(block.id);
     setSelectedId(block.id);
@@ -502,6 +599,8 @@ export default function FreeformEditor({
     block: FreeformBlock,
   ) => {
     if (e.button !== 0) return;
+    // 点击块即放弃此前刚创建的空框，标记失效
+    lastCreatedRef.current = null;
     e.stopPropagation();
     // Ctrl/Cmd 点选：切换块的选中状态（用于多选）
     if (e.ctrlKey || e.metaKey) {
@@ -510,6 +609,12 @@ export default function FreeformEditor({
         ? selectedIds.filter((i) => i !== block.id)
         : [...selectedIds, block.id];
       setSelectedIds(next);
+      setSelectedId(block.id);
+      return;
+    }
+    // 锁定块：可选中、可删除，但不可拖动/编辑（编辑由 contentEditable=false 兜底）
+    if (block.locked) {
+      if (!selectedIds.includes(block.id)) selectSingle(block.id);
       setSelectedId(block.id);
       return;
     }
@@ -554,6 +659,27 @@ export default function FreeformEditor({
     updateTextBlockFromEl(blockId, e.currentTarget);
   };
 
+  /** 文字块失焦：内容为空（无文字/图片/内嵌表格）的块自动移除，避免留下无内容的编辑框。
+   *  点击画布新建的块，其 mousedown 默认聚焦行为会紧接触发一次 blur（此时块刚被聚焦，
+   *  还没机会输入），需用 lastCreatedRef 跳过，等真正失焦（用户点击别处）再移除。 */
+  const handleTextBlur = (blockId: string) => {
+    setEditingId((prev) => (prev === blockId ? null : prev));
+    // 刚创建的文字块：跳过本次 blur 造成的移除，pointerup 后标记清除、下次失焦正常处理
+    if (lastCreatedRef.current === blockId) return;
+    const el = document.querySelector(
+      `[data-block-id="${blockId}"] .ff-text-editable`,
+    ) as HTMLElement | null;
+    if (!el) return; // 已被删除/卸载
+    // 含图片或内嵌表格视为有内容；仅空白（<br>、空格、nbsp 等）视为空
+    if (el.querySelector("table, img")) return;
+    if ((el.textContent ?? "").replace(/\s/g, "")) return;
+    const next = blocksRef.current.filter((b) => b.id !== blockId);
+    if (next.length === blocksRef.current.length) return;
+    applyBlocks(next);
+    setSelectedIds((prev) => prev.filter((id) => id !== blockId));
+    setSelectedId((prev) => (prev === blockId ? null : prev));
+  };
+
   const handleCellInput = (
     blockId: string,
     row: number,
@@ -581,11 +707,186 @@ export default function FreeformEditor({
     setContextMenu(null);
   };
 
-  /** 修改文字块样式（字号/颜色） */
-  const setTextStyle = (id: string, patch: { fontSize?: number; color?: string }) => {
+  // ---------- 块级复制 / 粘贴 / 复制副本 ----------
+
+  /** 复制当前选中块（深拷贝进内部剪贴板） */
+  const copyBlocks = () => {
+    const ids = selectedIds.length ? selectedIds : selectedId ? [selectedId] : [];
+    if (!ids.length) return;
+    const set = new Set(ids);
+    clipboardRef.current = blocksRef.current
+      .filter((b) => set.has(b.id))
+      .map((b) => JSON.parse(JSON.stringify(b)) as FreeformBlock);
+  };
+
+  /** 粘贴内部剪贴板中的块到指定画布位置（默认上次点击处/视口中心） */
+  const pasteBlocks = (at?: { x: number; y: number }) => {
+    if (!clipboardRef.current?.length) return;
+    const pos = at ?? lastClickRef.current ?? centerOfView();
+    // 单块粘贴向右下偏移，避免与原块完全重叠
+    const dx = clipboardRef.current.length === 1 ? 24 : 0;
+    const copies: FreeformBlock[] = clipboardRef.current.map((b) => {
+      const w = b.type === "table" && b.table ? tableTotalWidth(b.table) : b.width;
+      const p = clampToCanvas(pos.x + dx, pos.y + 24, w, b.height || 40);
+      return { ...b, id: newId(), x: p.x, y: p.y };
+    });
+    applyBlocks([...blocksRef.current, ...copies]);
+    selectSingle(copies[0].id);
+  };
+
+  /** 复制副本（Ctrl+D）：复制一份选中块贴在原内容右下角 */
+  const duplicateBlocks = () => {
+    const ids = selectedIds.length ? selectedIds : selectedId ? [selectedId] : [];
+    if (!ids.length) return;
+    const set = new Set(ids);
+    const sel = blocksRef.current.filter((b) => set.has(b.id));
+    if (!sel.length) return;
+    const minX = Math.min(...sel.map((b) => b.x));
+    const minY = Math.min(...sel.map((b) => b.y));
+    copyBlocks();
+    pasteBlocks({ x: minX, y: minY });
+  };
+
+  /** 修改文字块样式（字号/颜色/标题/行高/背景/边框） */
+  const setTextStyle = (
+    id: string,
+    patch: Partial<
+      Pick<
+        FreeformBlock,
+        "fontSize" | "color" | "heading" | "lineHeight" | "bgColor" | "borderColor"
+      >
+    >,
+  ) => {
     applyBlocks(
       blocksRef.current.map((b) => (b.id === id ? { ...b, ...patch } : b)),
     );
+    setContextMenu(null);
+  };
+
+  // ---------- 批量对齐 / 分布 ----------
+
+  type AlignMode =
+    | "left"
+    | "hcenter"
+    | "right"
+    | "top"
+    | "vcenter"
+    | "bottom"
+    | "hdist"
+    | "vdist";
+
+  /** 对选中块执行对齐 / 均分（基于选中集包围盒） */
+  const alignBlocks = (mode: AlignMode) => {
+    const ids = selectedIds.length ? selectedIds : selectedId ? [selectedId] : [];
+    if (ids.length < 2) return;
+    const set = new Set(ids);
+    const sel = blocksRef.current.filter((b) => set.has(b.id));
+    if (sel.length < 2) return;
+    const box = sel.map((b) => {
+      const w = b.type === "table" && b.table ? tableTotalWidth(b.table) : b.width;
+      const el = document.querySelector(
+        `[data-block-id="${b.id}"]`,
+      ) as HTMLElement | null;
+      const h = el ? Math.max(24, Math.round(el.offsetHeight)) : (b.height || 40);
+      return { b, w, h };
+    });
+    const minX = Math.min(...box.map((o) => o.b.x));
+    const maxX = Math.max(...box.map((o) => o.b.x + o.w));
+    const minY = Math.min(...box.map((o) => o.b.y));
+    const maxY = Math.max(...box.map((o) => o.b.y + o.h));
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+
+    // 均分：按坐标排序，把空隙平均分配到相邻块之间（至少 3 块且总宽/高小于包围盒才有效）
+    if (mode === "hdist" || mode === "vdist") {
+      const total = box.reduce((s, o) => s + (mode === "hdist" ? o.w : o.h), 0);
+      const span = mode === "hdist" ? maxX - minX : maxY - minY;
+      if (box.length < 3 || span <= total) return;
+      const sorted = [...box].sort((a, b) =>
+        mode === "hdist" ? a.b.x - b.b.x : a.b.y - b.b.y,
+      );
+      const gap = (span - total) / (box.length - 1);
+      const pos = new Map<string, number>();
+      let cur = 0;
+      sorted.forEach((o) => {
+        pos.set(o.b.id, cur);
+        cur += (mode === "hdist" ? o.w : o.h) + gap;
+      });
+      applyBlocks(
+        blocksRef.current.map((bb) => {
+          if (!set.has(bb.id)) return bb;
+          const p = pos.get(bb.id)!;
+          return mode === "hdist"
+            ? { ...bb, x: Math.round(minX + p) }
+            : { ...bb, y: Math.round(minY + p) };
+        }),
+      );
+      return;
+    }
+
+    applyBlocks(
+      blocksRef.current.map((bb) => {
+        if (!set.has(bb.id)) return bb;
+        const o = box.find((x) => x.b.id === bb.id)!;
+        let x = bb.x;
+        let y = bb.y;
+        if (mode === "left") x = minX;
+        else if (mode === "hcenter") x = cx - o.w / 2;
+        else if (mode === "right") x = maxX - o.w;
+        else if (mode === "top") y = minY;
+        else if (mode === "vcenter") y = cy - o.h / 2;
+        else if (mode === "bottom") y = maxY - o.h;
+        return { ...bb, x: Math.round(x), y: Math.round(y) };
+      }),
+    );
+  };
+
+  // ---------- 块级工具（锁定 / 层级 / 背景 / 边框） ----------
+
+  /** 通用设置块属性 */
+  const setBlockProps = (id: string, patch: Partial<FreeformBlock>) => {
+    applyBlocks(
+      blocksRef.current.map((b) => (b.id === id ? { ...b, ...patch } : b)),
+    );
+    setContextMenu(null);
+  };
+
+  /** 置于顶层 / 底层（通过 z 层级） */
+  const bringToFront = (id: string) => {
+    const maxZ = Math.max(0, ...blocksRef.current.map((b) => b.z ?? 0));
+    setBlockProps(id, { z: maxZ + 1 });
+  };
+  const sendToBack = (id: string) => {
+    const minZ = Math.min(0, ...blocksRef.current.map((b) => b.z ?? 0));
+    setBlockProps(id, { z: minZ - 1 });
+  };
+
+  /** 表格：表头行 / 边框色 / 单元格底色 */
+  const setHeaderRows = (id: string, n: number) => {
+    const b = blocksRef.current.find((x) => x.id === id);
+    if (!b?.table) return;
+    setTableData(id, { ...b.table, headerRows: n });
+    setContextMenu(null);
+  };
+  const setTableBorderColor = (id: string, color?: string) => {
+    const b = blocksRef.current.find((x) => x.id === id);
+    if (!b?.table) return;
+    setTableData(id, { ...b.table, borderColor: color });
+    setContextMenu(null);
+  };
+  const setCellBgColor = (id: string, row: number, col: number, color?: string) => {
+    const b = blocksRef.current.find((x) => x.id === id);
+    if (!b?.table) return;
+    const t = b.table;
+    const base =
+      t.cellBg ??
+      Array.from({ length: t.rows }, () => Array.from({ length: t.cols }, () => ""));
+    const cellBg = base.map((r, ri) => {
+      const next = [...r];
+      if (ri === row) next[col] = color ?? "";
+      return next;
+    });
+    setTableData(id, { ...t, cellBg });
     setContextMenu(null);
   };
 
@@ -605,7 +906,10 @@ export default function FreeformEditor({
     const cells = [...t.cells];
     const pos = dir === "above" ? at : at + 1;
     cells.splice(pos, 0, newRow);
-    setTableData(id, { ...t, rows: cells.length, cells });
+    // 同步单元格底色矩阵（新行插入后，底色行也跟随插入空行）
+    const cellBg = t.cellBg ? [...t.cellBg.map((r) => [...r])] : undefined;
+    if (cellBg) cellBg.splice(pos, 0, Array.from({ length: t.cols }, () => ""));
+    setTableData(id, { ...t, rows: cells.length, cells, cellBg });
     setContextMenu(null);
   };
 
@@ -613,14 +917,22 @@ export default function FreeformEditor({
     const b = blocksRef.current.find((x) => x.id === id);
     if (!b?.table) return;
     const t = b.table;
+    const pos = dir === "left" ? at : at + 1;
     const cells = t.cells.map((row) => {
       const next = [...row];
-      next.splice(dir === "left" ? at : at + 1, 0, "");
+      next.splice(pos, 0, "");
       return next;
     });
     const colWidths = [...t.colWidths];
-    colWidths.splice(dir === "left" ? at : at + 1, 0, DEFAULT_COL_WIDTH);
-    setTableData(id, { ...t, cols: cells[0].length, cells, colWidths });
+    colWidths.splice(pos, 0, DEFAULT_COL_WIDTH);
+    const cellBg = t.cellBg
+      ? t.cellBg.map((row) => {
+          const next = [...row];
+          next.splice(pos, 0, "");
+          return next;
+        })
+      : undefined;
+    setTableData(id, { ...t, cols: cells[0].length, cells, colWidths, cellBg });
     setContextMenu(null);
   };
 
@@ -629,7 +941,11 @@ export default function FreeformEditor({
     if (!b?.table || b.table.rows <= 1) return;
     const t = b.table;
     const cells = t.cells.filter((_, ri) => ri !== at);
-    setTableData(id, { ...t, rows: cells.length, cells });
+    const cellBg = t.cellBg ? t.cellBg.filter((_, ri) => ri !== at) : undefined;
+    // 删除表头行时同步 headerRows
+    const headerRows =
+      t.headerRows && at < t.headerRows ? Math.max(0, t.headerRows - 1) : t.headerRows;
+    setTableData(id, { ...t, rows: cells.length, cells, cellBg, headerRows });
     setContextMenu(null);
   };
 
@@ -639,7 +955,10 @@ export default function FreeformEditor({
     const t = b.table;
     const cells = t.cells.map((row) => row.filter((_, ci) => ci !== at));
     const colWidths = t.colWidths.filter((_, ci) => ci !== at);
-    setTableData(id, { ...t, cols: cells[0].length, cells, colWidths });
+    const cellBg = t.cellBg
+      ? t.cellBg.map((row) => row.filter((_, ci) => ci !== at))
+      : undefined;
+    setTableData(id, { ...t, cols: cells[0].length, cells, colWidths, cellBg });
     setContextMenu(null);
   };
 
@@ -927,6 +1246,7 @@ export default function FreeformEditor({
     const pos = clampToCanvas(block.x, block.y, block.width, block.height);
     block.x = pos.x;
     block.y = pos.y;
+    lastCreatedRef.current = block.id;
     focusIdRef.current = block.id;
     applyBlocks([...blocksRef.current, block]);
     selectSingle(block.id);
@@ -1012,6 +1332,45 @@ export default function FreeformEditor({
   useEffect(() => {
     window.addEventListener("keydown", handleDeleteKey);
     return () => window.removeEventListener("keydown", handleDeleteKey);
+  });
+
+  // 撤销/重做 / 块级复制粘贴 / 复制副本（仅在未编辑文本时拦截，避免与系统文本快捷键冲突）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const t = e.target as HTMLElement | null;
+      const editing =
+        t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+      if (editing) return;
+      const key = e.key.toLowerCase();
+      if (key === "z") {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+        return;
+      }
+      if (key === "y") {
+        e.preventDefault();
+        redo();
+        return;
+      }
+      if (key === "d") {
+        e.preventDefault();
+        duplicateBlocks();
+        return;
+      }
+      if (key === "c" && (selectedId || selectedIds.length > 0)) {
+        e.preventDefault();
+        copyBlocks();
+        return;
+      }
+      if (key === "v" && clipboardRef.current?.length) {
+        e.preventDefault();
+        pasteBlocks();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   });
 
   /** 新建文字块后聚焦并定位光标到末尾 */
@@ -1257,6 +1616,75 @@ export default function FreeformEditor({
     return () => window.removeEventListener("paste", onPaste);
   }, []);
 
+  // ---------- 文字选区浮动格式工具条（Notion 式） ----------
+
+  /** 执行选区级格式命令并同步块数据（加粗/斜体/下划线/高亮/颜色/列表/清除格式） */
+  const runFormat = (cmd: string, value?: string) => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+    const node = sel.focusNode;
+    const el = (
+      node && node.nodeType === 1
+        ? (node as HTMLElement)
+        : ((node?.parentElement as HTMLElement) ?? null)
+    ) as HTMLElement | null;
+    const editable = el?.closest?.(".ff-text-editable, .ff-cell") as HTMLElement | null;
+    document.execCommand(cmd, false, value);
+    if (!editable) return;
+    const blockId = editable.closest("[data-block-id]")?.getAttribute("data-block-id");
+    if (!blockId) return;
+    const cellEl = editable.classList.contains("ff-cell") ? editable : null;
+    if (cellEl) {
+      const row = Number(cellEl.dataset.row);
+      const col = Number(cellEl.dataset.col);
+      handleCellInput(
+        blockId,
+        row,
+        col,
+        { currentTarget: cellEl } as React.FormEvent<HTMLDivElement>,
+      );
+    } else {
+      updateTextBlockFromEl(blockId, editable);
+    }
+  };
+
+  /** 选区变化 → 定位浮动工具条到选区上方（滚动/点击画布时关闭） */
+  useEffect(() => {
+    const onSel = () => {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+        setFormatBar(null);
+        return;
+      }
+      const node = sel.focusNode;
+      const el = (
+        node && node.nodeType === 1
+          ? (node as HTMLElement)
+          : ((node?.parentElement as HTMLElement) ?? null)
+      ) as HTMLElement | null;
+      const editable = el?.closest?.(".ff-text-editable, .ff-cell") as HTMLElement | null;
+      if (!editable) {
+        setFormatBar(null);
+        return;
+      }
+      const rect = sel.getRangeAt(0).getBoundingClientRect();
+      const blockId = editable.closest("[data-block-id]")?.getAttribute("data-block-id") ?? "";
+      setFormatBar({
+        x: rect.left + rect.width / 2,
+        y: rect.top,
+        blockId,
+        inCell: editable.classList.contains("ff-cell"),
+      });
+    };
+    const onScroll = () => setFormatBar(null);
+    document.addEventListener("selectionchange", onSel);
+    scrollRef.current?.addEventListener("scroll", onScroll);
+    return () => {
+      document.removeEventListener("selectionchange", onSel);
+      scrollRef.current?.removeEventListener("scroll", onScroll);
+    };
+  }, []);
+
   // ---------- 右键菜单内容 ----------
 
   const renderContextMenu = () => {
@@ -1270,17 +1698,21 @@ export default function FreeformEditor({
       contextMenu.inlineTableId !== null &&
       contextMenu.row !== null &&
       contextMenu.col !== null;
-    // 菜单靠近屏幕边缘时向内收，避免溢出
-    const MENU_W = 180;
-    const MENU_H = 420;
+    // 菜单靠近屏幕边缘时向内收，避免溢出；高度按视口剩余空间自适应（内容多时菜单内部滚动）
+    const MENU_W = 190;
     const menuLeft = Math.min(contextMenu.x, window.innerWidth - MENU_W);
-    const menuTop = Math.min(contextMenu.y, window.innerHeight - MENU_H);
+    const menuTop = Math.max(4, Math.min(contextMenu.y, window.innerHeight - 48));
+    const menuMaxH = Math.max(120, window.innerHeight - menuTop - 12);
 
     return (
       <div
         className="ff-menu"
         ref={menuRef}
-        style={{ left: Math.max(4, menuLeft), top: Math.max(4, menuTop) }}
+        style={{
+          left: Math.max(4, menuLeft),
+          top: menuTop,
+          maxHeight: menuMaxH,
+        }}
         onContextMenu={(e) => e.preventDefault()}
       >
         {!block && (
@@ -1291,6 +1723,20 @@ export default function FreeformEditor({
             <button className="ff-menu-item" onClick={handleMenuInsertTable}>
               插入表格
             </button>
+            {clipboardRef.current && (
+              <>
+                <div className="ff-menu-sep" />
+                <button
+                  className="ff-menu-item"
+                  onClick={() => {
+                    pasteBlocks(toPage(contextMenu.x, contextMenu.y));
+                    setContextMenu(null);
+                  }}
+                >
+                  粘贴
+                </button>
+              </>
+            )}
           </>
         )}
 
@@ -1334,6 +1780,70 @@ export default function FreeformEditor({
                 />
               ))}
             </div>
+            <div className="ff-menu-group">标题</div>
+            <div className="ff-menu-sizes">
+              <button
+                className={`ff-menu-item ff-size-item ${!block.heading ? "active" : ""}`}
+                onClick={() => setTextStyle(block.id, { heading: undefined })}
+              >
+                正文
+              </button>
+              {[1, 2, 3].map((h) => (
+                <button
+                  key={h}
+                  className={`ff-menu-item ff-size-item ${block.heading === h ? "active" : ""}`}
+                  onClick={() => setTextStyle(block.id, { heading: h })}
+                >
+                  H{h}
+                </button>
+              ))}
+            </div>
+            <div className="ff-menu-group">行高</div>
+            <div className="ff-menu-sizes">
+              {LINE_HEIGHTS.map((lh) => (
+                <button
+                  key={lh}
+                  className={`ff-menu-item ff-size-item ${block.lineHeight === lh ? "active" : ""}`}
+                  onClick={() => setTextStyle(block.id, { lineHeight: lh })}
+                >
+                  {lh}
+                </button>
+              ))}
+            </div>
+            <div className="ff-menu-group">背景色</div>
+            <div className="ff-menu-colors">
+              <button
+                className="ff-color-dot ff-color-none"
+                title="无背景"
+                onClick={() => setTextStyle(block.id, { bgColor: undefined })}
+              />
+              {CELL_BG_COLORS.map((c) => (
+                <button
+                  key={c}
+                  className="ff-color-dot"
+                  style={{ background: c }}
+                  title={c}
+                  onClick={() => setTextStyle(block.id, { bgColor: c })}
+                />
+              ))}
+            </div>
+            <div className="ff-menu-group">边框</div>
+            <div className="ff-menu-colors">
+              <button
+                className="ff-color-dot ff-color-none"
+                title="无边框"
+                onClick={() => setTextStyle(block.id, { borderColor: undefined })}
+              />
+              {BORDER_COLORS.map((c) => (
+                <button
+                  key={c}
+                  className="ff-color-dot"
+                  style={{ background: c }}
+                  title={c}
+                  onClick={() => setTextStyle(block.id, { borderColor: c })}
+                />
+              ))}
+            </div>
           </>
         )}
 
@@ -1358,19 +1868,126 @@ export default function FreeformEditor({
             <button className="ff-menu-item" onClick={() => handleTableMenuAction("delCol")}>
               删除当前列
             </button>
+            {isTable && block.type === "table" && (
+              <>
+                <div className="ff-menu-sep" />
+                <button
+                  className="ff-menu-item"
+                  onClick={() =>
+                    setHeaderRows(
+                      block.id,
+                      (block.table!.headerRows ?? 0) > 0 ? 0 : 1,
+                    )
+                  }
+                >
+                  {(block.table!.headerRows ?? 0) > 0 ? "取消表头行" : "设为表头行"}
+                </button>
+                <div className="ff-menu-group">边框颜色</div>
+                <div className="ff-menu-colors">
+                  <button
+                    className="ff-color-dot ff-color-none"
+                    title="默认边框"
+                    onClick={() => setTableBorderColor(block.id, undefined)}
+                  />
+                  {BORDER_COLORS.map((c) => (
+                    <button
+                      key={c}
+                      className="ff-color-dot"
+                      style={{ background: c }}
+                      title={c}
+                      onClick={() => setTableBorderColor(block.id, c)}
+                    />
+                  ))}
+                </div>
+                {contextMenu.row !== null && contextMenu.col !== null && (
+                  <>
+                    <div className="ff-menu-group">单元格底色</div>
+                    <div className="ff-menu-colors">
+                      <button
+                        className="ff-color-dot ff-color-none"
+                        title="无底色"
+                        onClick={() =>
+                          setCellBgColor(
+                            block.id,
+                            contextMenu.row!,
+                            contextMenu.col!,
+                            undefined,
+                          )
+                        }
+                      />
+                      {CELL_BG_COLORS.map((c) => (
+                        <button
+                          key={c}
+                          className="ff-color-dot"
+                          style={{ background: c }}
+                          title={c}
+                          onClick={() =>
+                            setCellBgColor(block.id, contextMenu.row!, contextMenu.col!, c)
+                          }
+                        />
+                      ))}
+                    </div>
+                  </>
+                )}
+              </>
+            )}
           </>
         )}
 
         {block && (
-          <button className="ff-menu-item ff-menu-danger" onClick={() => deleteBlocks([block.id])}>
-            删除{block.type === "table" ? "表格" : block.type === "text" ? "文字" : "内容"}
-          </button>
+          <>
+            <div className="ff-menu-sep" />
+            <button
+              className="ff-menu-item"
+              onClick={() => {
+                copyBlocks();
+                setContextMenu(null);
+              }}
+            >
+              复制
+            </button>
+            {clipboardRef.current && (
+              <button
+                className="ff-menu-item"
+                onClick={() => {
+                  pasteBlocks(toPage(contextMenu.x, contextMenu.y));
+                  setContextMenu(null);
+                }}
+              >
+                粘贴
+              </button>
+            )}
+            <button
+              className="ff-menu-item"
+              onClick={() => setBlockProps(block.id, { locked: !block.locked })}
+            >
+              {block.locked ? "解锁" : "锁定"}
+            </button>
+            <button className="ff-menu-item" onClick={() => bringToFront(block.id)}>
+              置于顶层
+            </button>
+            <button className="ff-menu-item" onClick={() => sendToBack(block.id)}>
+              置于底层
+            </button>
+            <button
+              className="ff-menu-item ff-menu-danger"
+              onClick={() => deleteBlocks([block.id])}
+            >
+              删除{block.type === "table" ? "表格" : block.type === "text" ? "文字" : "内容"}
+            </button>
+          </>
         )}
       </div>
     );
   };
 
   // ---------- 渲染 ----------
+
+  /** 浮动格式工具条当前作用块的样式值 */
+  const formatBlock = formatBar
+    ? blocks.find((b) => b.id === formatBar.blockId)
+    : undefined;
+  const formatBlockHeading = formatBlock?.heading ?? 0;
 
   return (
     <div className="freeform-editor">
@@ -1379,22 +1996,34 @@ export default function FreeformEditor({
           <button
             className={mode === "text" ? "ff-btn active" : "ff-btn"}
             onClick={() => setMode("text")}
-            title="点击画布任意位置直接输入文字"
+            title="文字：点击画布任意位置直接输入"
           >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5 6h14" />
+              <path d="M12 6v13" />
+              <path d="M9.5 19h5" />
+            </svg>
             文字
           </button>
           <button
             className={mode === "select" ? "ff-btn active" : "ff-btn"}
             onClick={() => setMode("select")}
-            title="选择/拖动已有内容"
+            title="选择：框选 / 拖动已有内容"
           >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5 3l14 8.5-5.5 1.2L10.5 18 8 21z" />
+            </svg>
             选择
           </button>
           <button
             className={mode === "draw" ? "ff-btn active" : "ff-btn"}
             onClick={() => setMode("draw")}
-            title="在画布上自由涂鸦"
+            title="画笔：在画布上自由涂鸦"
           >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 0 1 3 3L8 19z" />
+              <path d="M13.5 6.5l4 4" />
+            </svg>
             画笔
           </button>
           <button
@@ -1402,13 +2031,24 @@ export default function FreeformEditor({
             onClick={() => fileRef.current?.click()}
             title="插入图片（也可 Ctrl+V 粘贴截图）"
           >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="5" width="18" height="14" rx="2" />
+              <circle cx="8.5" cy="10" r="1.5" />
+              <path d="M21 15l-5-5-8 8" />
+            </svg>
             图片
           </button>
           <button
             className="ff-btn"
             onClick={() => insertTableFromCaret()}
-            title="插入表格（光标在文字里时内嵌在光标处，否则放在点击处）"
+            title="插入表格（光标在文字里时内嵌，否则放在点击处）"
           >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="4" width="18" height="16" rx="2" />
+              <path d="M3 10h18" />
+              <path d="M3 16h18" />
+              <path d="M9.5 4v16" />
+            </svg>
             表格
           </button>
           <input
@@ -1419,12 +2059,144 @@ export default function FreeformEditor({
             onChange={insertImage}
           />
         </div>
+
+        {mode === "draw" && (
+          <div className="ff-draw-options">
+            {DRAW_COLORS.map((c) => (
+              <span
+                key={c}
+                className={`ff-draw-color ${drawColor === c ? "active" : ""}`}
+                style={{ background: c }}
+                title={c}
+                onClick={() => setDrawColor(c)}
+              />
+            ))}
+            <div className="ff-draw-widths">
+              {DRAW_WIDTHS.map((w) => (
+                <span
+                  key={w}
+                  className={`ff-draw-width ${drawWidth === w ? "active" : ""}`}
+                  title={`粗细 ${w}`}
+                  onClick={() => setDrawWidth(w)}
+                >
+                  <i style={{ width: Math.max(4, w * 2), height: Math.max(4, w * 2) }} />
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {selectedIds.length >= 2 && (
+          <div className="ff-align-group">
+            <button
+              className="ff-btn ff-icon-btn"
+              title="左对齐"
+              onClick={() => alignBlocks("left")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M4 6h16M4 12h9M4 18h13" />
+              </svg>
+            </button>
+            <button
+              className="ff-btn ff-icon-btn"
+              title="水平居中"
+              onClick={() => alignBlocks("hcenter")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M6 6h12M4 12h16M7 18h10" />
+              </svg>
+            </button>
+            <button
+              className="ff-btn ff-icon-btn"
+              title="右对齐"
+              onClick={() => alignBlocks("right")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M4 6h16M11 12h9M7 18h13" />
+              </svg>
+            </button>
+            <button
+              className="ff-btn ff-icon-btn"
+              title="顶部对齐"
+              onClick={() => alignBlocks("top")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M6 4h12M6 5v14M12 9v10M18 5v14" />
+              </svg>
+            </button>
+            <button
+              className="ff-btn ff-icon-btn"
+              title="垂直居中"
+              onClick={() => alignBlocks("vcenter")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M4 12h16M6 5v14M12 8v8M18 5v14" />
+              </svg>
+            </button>
+            <button
+              className="ff-btn ff-icon-btn"
+              title="底部对齐"
+              onClick={() => alignBlocks("bottom")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M6 20h12M6 5v15M12 10v10M18 5v15" />
+              </svg>
+            </button>
+            <button
+              className="ff-btn ff-icon-btn"
+              title="水平均分"
+              onClick={() => alignBlocks("hdist")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="4" y="7" width="3" height="10" rx="0.5" />
+                <rect x="10.5" y="7" width="3" height="10" rx="0.5" />
+                <rect x="17" y="7" width="3" height="10" rx="0.5" />
+              </svg>
+            </button>
+            <button
+              className="ff-btn ff-icon-btn"
+              title="垂直均分"
+              onClick={() => alignBlocks("vdist")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="7" y="4" width="10" height="3" rx="0.5" />
+                <rect x="7" y="10.5" width="10" height="3" rx="0.5" />
+                <rect x="7" y="17" width="10" height="3" rx="0.5" />
+              </svg>
+            </button>
+          </div>
+        )}
+
+        <div className="ff-sep" />
+
         <div className="ff-zoom-group">
-          <button className="ff-btn" onClick={zoomOut} title="缩小 (Ctrl+滚轮)">
+          <button
+            className="ff-btn ff-icon-btn"
+            onClick={undo}
+            disabled={!canUndo}
+            title="撤销 (Ctrl+Z)"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 14L4 9l5-5" />
+              <path d="M4 9h10a6 6 0 0 1 0 12h-3" />
+            </svg>
+          </button>
+          <button
+            className="ff-btn ff-icon-btn"
+            onClick={redo}
+            disabled={!canRedo}
+            title="重做 (Ctrl+Shift+Z / Ctrl+Y)"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M15 14l5-5-5-5" />
+              <path d="M20 9H10a6 6 0 0 0 0 12h3" />
+            </svg>
+          </button>
+          <button className="ff-btn ff-icon-btn" onClick={zoomOut} title="缩小 (Ctrl+滚轮)">
             −
           </button>
           <span className="ff-zoom-label">{Math.round(zoom * 100)}%</span>
-          <button className="ff-btn" onClick={zoomIn} title="放大 (Ctrl+滚轮)">
+          <button className="ff-btn ff-icon-btn" onClick={zoomIn} title="放大 (Ctrl+滚轮)">
             +
           </button>
         </div>
@@ -1433,6 +2205,11 @@ export default function FreeformEditor({
             className="ff-btn ff-btn-danger"
             onClick={() => deleteBlocks(selectedIds.length ? selectedIds : [selectedId!])}
           >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 6h18" />
+              <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+            </svg>
             删除
           </button>
         )}
@@ -1455,35 +2232,28 @@ export default function FreeformEditor({
               const tW = block.type === "table" ? tableTotalWidth(block.table) : 0;
               return (
                 <div
-                  key={block.id}
-                  className={`ff-block ${selected ? "ff-selected" : ""}`}
-                  style={
-                    block.type === "text"
-                      ? {
-                          left: block.x,
-                          top: block.y,
-                          width: block.width,
-                          minHeight: 40,
-                        }
-                      : block.type === "table"
-                        ? {
-                            left: block.x,
-                            top: block.y,
-                            width: tW,
-                            minHeight: 40,
-                          }
-                        : {
-                            left: block.x,
-                            top: block.y,
-                            width: block.width,
-                            height: block.height,
-                          }
+                  key={
+                    block.type === "text" || block.type === "table"
+                      ? `${block.id}:${ver}`
+                      : block.id
                   }
+                  className={`ff-block ${selected ? "ff-selected" : ""}`}
+                  style={{
+                    left: block.x,
+                    top: block.y,
+                    width: block.type === "table" ? tW : block.width,
+                    minHeight: block.type === "text" || block.type === "table" ? 40 : undefined,
+                    height:
+                      block.type === "text" || block.type === "table" ? undefined : block.height,
+                    background: block.bgColor,
+                    border: block.borderColor ? `1.5px solid ${block.borderColor}` : undefined,
+                    zIndex: block.z ?? 0,
+                  }}
                   data-block-id={block.id}
                   onPointerDown={(e) => handleBlockDown(e, block)}
                   onContextMenu={(e) => handleBlockContextMenu(e, block)}
                 >
-                  {(block.type === "text" || block.type === "table") && (
+                  {!block.locked && (block.type === "text" || block.type === "table") && (
                     <div
                       className="ff-move-handle"
                       title="拖动"
@@ -1493,15 +2263,28 @@ export default function FreeformEditor({
                     </div>
                   )}
 
+                  {block.locked && (
+                    <span className="ff-lock-badge" title="已锁定（右键可解锁）">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                        <rect x="5" y="11" width="14" height="9" rx="2" />
+                      </svg>
+                    </span>
+                  )}
+
                   {block.type === "text" && (
                     <div
                       className="ff-text-editable"
-                      contentEditable
+                      contentEditable={!block.locked}
                       suppressContentEditableWarning
                       data-init=""
                       style={{
-                        fontSize: block.fontSize ?? DEFAULT_FONT_SIZE,
+                        fontSize: block.heading
+                          ? (HEADING_SIZES[block.heading] ?? DEFAULT_FONT_SIZE)
+                          : (block.fontSize ?? DEFAULT_FONT_SIZE),
+                        fontWeight: block.heading ? 600 : undefined,
                         color: block.color ?? DEFAULT_COLOR,
+                        lineHeight: block.lineHeight,
                       }}
                       ref={(el) => {
                         if (el && !el.dataset.ready) {
@@ -1515,7 +2298,7 @@ export default function FreeformEditor({
                         setEditingId(block.id);
                         if (!selectedIds.includes(block.id)) selectSingle(block.id);
                       }}
-                      onBlur={() => setEditingId(null)}
+                      onBlur={() => handleTextBlur(block.id)}
                     />
                   )}
 
@@ -1557,19 +2340,32 @@ export default function FreeformEditor({
                     >
                       <tbody>
                         {block.table.cells.map((row, ri) => (
-                          <tr key={ri}>
+                          <tr
+                            key={ri}
+                            className={
+                              ri < (block.table!.headerRows ?? 0) ? "ff-th-row" : undefined
+                            }
+                          >
                             {row.map((cell, ci) => (
                               <td
                                 key={ci}
-                                style={{ width: block.table!.colWidths[ci] ?? DEFAULT_COL_WIDTH }}
+                                style={{
+                                  width: block.table!.colWidths[ci] ?? DEFAULT_COL_WIDTH,
+                                  border: block.table!.borderColor
+                                    ? `1px solid ${block.table!.borderColor}`
+                                    : undefined,
+                                }}
                               >
                                 <div
                                   className="ff-cell"
-                                  contentEditable
+                                  contentEditable={!block.locked}
                                   suppressContentEditableWarning
                                   data-cell="1"
                                   data-row={ri}
                                   data-col={ci}
+                                  style={{
+                                    background: block.table!.cellBg?.[ri]?.[ci] || undefined,
+                                  }}
                                   ref={(el) => {
                                     if (el && !el.dataset.ready) {
                                       el.dataset.ready = "1";
@@ -1582,11 +2378,13 @@ export default function FreeformEditor({
                                   onBlur={() => setEditingId(null)}
                                 />
                                 {/* 列宽拖拽手柄（悬停时出现） */}
-                                <div
-                                  className="ff-col-resizer"
-                                  title="拖动调整列宽"
-                                  onPointerDown={(e) => startColResize(e, block, ci)}
-                                />
+                                {!block.locked && (
+                                  <div
+                                    className="ff-col-resizer"
+                                    title="拖动调整列宽"
+                                    onPointerDown={(e) => startColResize(e, block, ci)}
+                                  />
+                                )}
                               </td>
                             ))}
                           </tr>
@@ -1595,14 +2393,14 @@ export default function FreeformEditor({
                     </table>
                   )}
 
-                  {selected && primary && block.type === "image" && (
+                  {selected && primary && !block.locked && block.type === "image" && (
                     <div
                       className="ff-resize"
                       title="调整大小"
                       onPointerDown={(e) => startResize(e, block)}
                     />
                   )}
-                  {selected && primary && block.type === "table" && (
+                  {selected && primary && !block.locked && block.type === "table" && (
                     <div
                       className="ff-resize"
                       title="调整表格宽度"
@@ -1660,12 +2458,118 @@ export default function FreeformEditor({
 
       {renderContextMenu()}
 
+      {formatBar && (
+        <div
+          className="ff-format-bar"
+          style={{ left: formatBar.x, top: formatBar.y - 8 }}
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          <select
+            className="ff-fbtn-select"
+            value={formatBlockHeading}
+            onChange={(e) =>
+              setTextStyle(formatBar.blockId, {
+                heading: Number(e.target.value) || undefined,
+              })
+            }
+            title="标题样式"
+          >
+            <option value={0}>正文</option>
+            <option value={1}>H1 标题</option>
+            <option value={2}>H2 标题</option>
+            <option value={3}>H3 标题</option>
+          </select>
+          <span className="ff-fsep" />
+          <button className="ff-fbtn" onClick={() => runFormat("bold")} title="加粗 (Ctrl+B)">
+            <b>B</b>
+          </button>
+          <button className="ff-fbtn" onClick={() => runFormat("italic")} title="斜体 (Ctrl+I)">
+            <i>I</i>
+          </button>
+          <button className="ff-fbtn" onClick={() => runFormat("underline")} title="下划线 (Ctrl+U)">
+            <u>U</u>
+          </button>
+          <div className="ff-format-colors" title="文字高亮">
+            {HIGHLIGHT_COLORS.map((c) => (
+              <span
+                key={c}
+                className="ff-format-color"
+                style={{ background: c }}
+                title={`高亮 ${c}`}
+                onClick={() => runFormat("hiliteColor", c)}
+              />
+            ))}
+          </div>
+          <span className="ff-fsep" />
+          <select
+            className="ff-fbtn-select"
+            value={
+              blocks.find((b) => b.id === formatBar.blockId)?.fontSize ?? DEFAULT_FONT_SIZE
+            }
+            onChange={(e) =>
+              setTextStyle(formatBar.blockId, { fontSize: Number(e.target.value) })
+            }
+            title="字号"
+          >
+            {FONT_SIZES.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+          </select>
+          <div className="ff-format-colors">
+            {TEXT_COLORS.map((c) => (
+              <span
+                key={c}
+                className="ff-format-color"
+                style={{ background: c }}
+                title={c}
+                onClick={() => runFormat("foreColor", c)}
+              />
+            ))}
+          </div>
+          <span className="ff-fsep" />
+          <button className="ff-fbtn" onClick={() => runFormat("justifyLeft")} title="左对齐">
+            ≡l
+          </button>
+          <button className="ff-fbtn" onClick={() => runFormat("justifyCenter")} title="居中">
+            ≡c
+          </button>
+          <button className="ff-fbtn" onClick={() => runFormat("justifyRight")} title="右对齐">
+            ≡r
+          </button>
+          <span className="ff-fsep" />
+          <button
+            className="ff-fbtn"
+            onClick={() => runFormat("insertUnorderedList")}
+            title="无序列表"
+          >
+            ≡
+          </button>
+          <button
+            className="ff-fbtn"
+            onClick={() => runFormat("insertOrderedList")}
+            title="有序列表"
+          >
+            1.
+          </button>
+          <button
+            className="ff-fbtn"
+            onClick={() => runFormat("removeFormat")}
+            title="清除格式"
+          >
+            Tx
+          </button>
+        </div>
+      )}
+
       <div className="ff-hint">
         {mode === "text"
-          ? "点击画布任意位置输入文字；在内容上右键可调整字号颜色、表格行列；Ctrl+V 直接粘贴截图"
+          ? "点击画布任意位置输入文字；选中文字可用加粗/斜体/列表；Ctrl+Z 撤销、Ctrl+D 复制内容"
           : mode === "draw"
-            ? "按住鼠标在画布上自由涂鸦，松开结束；Ctrl+V 直接粘贴截图"
-            : "框选或 Ctrl+点选多个内容整体拖动；拖表格列边框调列宽；Delete 删除；在内容上右键可编辑表格行列；Ctrl+V 直接粘贴截图"}
+            ? "按住鼠标在画布上自由涂鸦，松开结束；可切换颜色与粗细；Ctrl+Z 撤销"
+            : "框选或 Ctrl+点选多个内容整体拖动；Ctrl+C/V 复制粘贴、Ctrl+D 复制副本、Delete 删除；Ctrl+Z 撤销"}
       </div>
     </div>
   );

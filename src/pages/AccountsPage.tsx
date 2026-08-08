@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { accountsApi } from "../api";
 import type { Account } from "../types";
+import { toast, toastUndo } from "../components/Toaster";
+import { consumePendingNavigate } from "../lib/events";
 
 const emptyForm: Omit<Account, "id" | "createdAt" | "updatedAt"> = {
   title: "",
@@ -15,9 +17,18 @@ export default function AccountsPage() {
   const [form, setForm] = useState(emptyForm);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [showPassword, setShowPassword] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   async function refresh() {
-    setAccounts(await accountsApi.list());
+    const list = await accountsApi.list();
+    setAccounts(list);
+    setLoading(false);
+    // 处理命令面板跳转（数据就绪后选中目标账号）
+    const target = consumePendingNavigate();
+    if (target?.accountId) {
+      const acc = list.find((a) => a.id === target.accountId);
+      if (acc) handleSelect(acc);
+    }
   }
 
   useEffect(() => {
@@ -36,23 +47,79 @@ export default function AccountsPage() {
   }
 
   async function handleSave() {
-    if (!form.title.trim()) return;
-    if (editingId) {
-      await accountsApi.update({ ...form, id: editingId } as Account);
-    } else {
-      await accountsApi.create({ ...form, id: "" } as Account);
+    if (!form.title.trim()) {
+      toast("请填写名称", { kind: "error" });
+      return;
     }
-    setForm(emptyForm);
-    setEditingId(null);
-    refresh();
+    try {
+      if (editingId) {
+        await accountsApi.update({ ...form, id: editingId } as Account);
+        toast("账号已更新");
+      } else {
+        await accountsApi.create({ ...form, id: "" } as Account);
+        toast("账号已保存");
+      }
+      setForm(emptyForm);
+      setEditingId(null);
+      refresh();
+    } catch (e) {
+      console.error(e);
+      toast("保存失败，请重试", { kind: "error" });
+    }
   }
 
+  /** 删除账号（支持撤销：用已有字段重建） */
   async function handleDelete() {
     if (!editingId) return;
-    await accountsApi.delete(editingId);
-    setForm(emptyForm);
-    setEditingId(null);
-    refresh();
+    const snapshot = accounts.find((a) => a.id === editingId);
+    try {
+      await accountsApi.delete(editingId);
+      setForm(emptyForm);
+      setEditingId(null);
+      await refresh();
+      if (snapshot) {
+        toastUndo(`已删除「${snapshot.title}」`, () => restoreAccount(snapshot));
+      }
+    } catch (e) {
+      console.error(e);
+      toast("删除失败，请重试", { kind: "error" });
+    }
+  }
+
+  /** 撤销删除：重建账号 */
+  async function restoreAccount(snapshot: Account) {
+    try {
+      await accountsApi.create({
+        title: snapshot.title,
+        username: snapshot.username,
+        password: snapshot.password,
+        url: snapshot.url,
+        notes: snapshot.notes,
+      } as Account);
+      await refresh();
+      toast("账号已恢复");
+    } catch (e) {
+      console.error(e);
+      toast("恢复失败", { kind: "error" });
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="page accounts-page">
+        <aside className="accounts-list">
+          <div className="accounts-list-header"><span>账号列表</span></div>
+          <div className="skeleton-list">
+            {Array.from({ length: 5 }, (_, i) => (
+              <div key={i} className="skeleton skeleton-row" />
+            ))}
+          </div>
+        </aside>
+        <section className="account-form">
+          <div className="skeleton skeleton-form" />
+        </section>
+      </div>
+    );
   }
 
   return (
@@ -77,7 +144,24 @@ export default function AccountsPage() {
             <div className="account-item-sub">{acc.username}</div>
           </div>
         ))}
-        {accounts.length === 0 && <div className="empty-tip">暂无账号，点击"新增"录入</div>}
+        {accounts.length === 0 && (
+          <div className="empty-state">
+            <div className="empty-state-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+              </svg>
+            </div>
+            <p className="empty-state-title">还没有账号</p>
+            <p className="empty-state-hint">保存网站、应用的用户名和密码，全部加密存储</p>
+            <button
+              className="primary"
+              onClick={() => { setEditingId(null); setForm(emptyForm); }}
+            >
+              新增账号
+            </button>
+          </div>
+        )}
       </aside>
 
       <section className="account-form">

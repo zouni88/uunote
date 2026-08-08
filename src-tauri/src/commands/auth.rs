@@ -15,7 +15,11 @@ pub fn setup_master_password(app: tauri::AppHandle, password: String) -> Result<
 pub fn unlock_app(app: tauri::AppHandle, password: String) -> Result<bool, String> {
     let st = super::state(&app);
     match st.unlock(&password) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            // 解锁成功后启动后台自动同步循环（静默拉取 + 推送）
+            crate::sync::start_background_sync(st);
+            Ok(true)
+        }
         Err(_) => Ok(false),
     }
 }

@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use tauri::async_runtime::spawn_blocking;
 
@@ -9,6 +10,7 @@ use super::err;
 use crate::crypto;
 use crate::db::documents::{self, Document};
 use crate::error::{AppError, AppResult};
+use crate::state::AppState;
 use crate::sync;
 
 /// 简单根据扩展名推断 MIME
@@ -50,12 +52,12 @@ pub fn list_documents(app: tauri::AppHandle) -> Result<Vec<Document>, String> {
 #[tauri::command]
 pub async fn import_document(app: tauri::AppHandle, src_path: String) -> Result<Document, String> {
     let st = super::state(&app);
-    spawn_blocking(move || import_document_sync(&st, &src_path).map_err(err))
+    spawn_blocking(move || import_document_sync(st, &src_path).map_err(err))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn import_document_sync(st: &crate::state::AppState, src_path: &str) -> AppResult<Document> {
+fn import_document_sync(st: Arc<AppState>, src_path: &str) -> AppResult<Document> {
     let key = st.master_key()?;
     let vault_dir = st.vault_dir.lock().unwrap().clone();
     let src = Path::new(src_path);
@@ -90,29 +92,31 @@ fn import_document_sync(st: &crate::state::AppState, src_path: &str) -> AppResul
     let created = documents::create(&conn, &doc)?;
     drop(conn);
 
-    // 尝试自动推送，失败不阻断
-    let _ = sync::push(st);
+    // 后台静默同步（失败不影响导入）
+    sync::auto_commit(st);
     Ok(created)
 }
 
 #[tauri::command]
 pub async fn delete_document(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let st = super::state(&app);
-    spawn_blocking(move || delete_document_sync(&st, &id).map_err(err))
+    spawn_blocking(move || delete_document_sync(st, &id).map_err(err))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn delete_document_sync(st: &crate::state::AppState, id: &str) -> AppResult<()> {
+fn delete_document_sync(st: Arc<AppState>, id: &str) -> AppResult<()> {
     st.master_key()?;
-    let conn = st.db.lock().unwrap();
-    let doc = documents::get(&conn, id)?;
-    documents::delete(&conn, id)?;
-    drop(conn);
-    if let Some(doc) = doc {
-        let _ = fs::remove_file(st.vault_dir.lock().unwrap().join(&doc.file_path));
+    // documents::delete 返回被删记录的 file_path（删除操作日志中已携带，供其他设备清理）
+    let file_path = {
+        let conn = st.db.lock().unwrap();
+        documents::delete(&conn, id)?
+    };
+    if let Some(fp) = file_path {
+        let _ = fs::remove_file(st.vault_dir.lock().unwrap().join(&fp));
     }
-    let _ = sync::push(st);
+    // 后台静默同步（失败不影响删除）
+    sync::auto_commit(st);
     Ok(())
 }
 

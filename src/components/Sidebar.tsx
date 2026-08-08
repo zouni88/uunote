@@ -1,4 +1,7 @@
-import type { PageKey } from "../types";
+import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { syncApi } from "../api";
+import type { PageKey, SyncStatus } from "../types";
 
 interface SidebarProps {
   current: PageKey;
@@ -45,9 +48,43 @@ const items: { key: PageKey; label: string; icon: React.ReactNode }[] = [
       </svg>
     ),
   },
+  {
+    key: "about",
+    label: "关于",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="10" />
+        <path d="M12 16v-4" />
+        <path d="M12 8h.01" />
+      </svg>
+    ),
+  },
 ];
 
+const syncLabels: Record<SyncStatus["state"], string> = {
+  idle: "本地优先 · 加密同步",
+  pending: "等待同步…",
+  syncing: "正在同步…",
+  synced: "已同步",
+  error: "同步出错",
+};
+
 export default function Sidebar({ current, onChange }: SidebarProps) {
+  // 同步状态：初始化拉取一次，此后由后端 sync://status 事件实时更新
+  const [sync, setSync] = useState<SyncStatus>({ state: "idle", message: "本地优先 · 加密同步" });
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    syncApi
+      .status()
+      .then(setSync)
+      .catch(() => {});
+    listen<SyncStatus>("sync://status", (e) => setSync(e.payload))
+      .then((fn) => (unlisten = fn))
+      .catch(() => {});
+    return () => unlisten?.();
+  }, []);
+
   return (
     <nav className="sidebar">
       <div className="sidebar-brand">
@@ -67,9 +104,9 @@ export default function Sidebar({ current, onChange }: SidebarProps) {
           </li>
         ))}
       </ul>
-      <div className="sidebar-footer">
-        <span className="sync-dot" />
-        <span>本地优先 · 加密同步</span>
+      <div className="sidebar-footer" title={sync.message || syncLabels[sync.state]}>
+        <span className={`sync-dot sync-${sync.state}`} />
+        <span className="sync-label">{syncLabels[sync.state]}</span>
       </div>
     </nav>
   );

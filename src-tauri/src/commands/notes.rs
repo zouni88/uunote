@@ -13,11 +13,15 @@ pub fn list_notes(app: tauri::AppHandle) -> Result<Vec<Note>, String> {
 }
 
 #[tauri::command]
-pub fn create_note(app: tauri::AppHandle, title: String) -> Result<Note, String> {
+pub fn create_note(
+    app: tauri::AppHandle,
+    title: String,
+    group_id: Option<String>,
+) -> Result<Note, String> {
     let st = super::state(&app);
     st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
-    let note = notes::create(&conn, &title).map_err(err)?;
+    let note = notes::create(&conn, &title, group_id).map_err(err)?;
     drop(conn);
     // 自动提交并推送（后台静默执行）
     sync::auto_commit(st);

@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use rusqlite::Connection;
+use serde::Serialize;
 
 use crate::crypto;
 use crate::db;
@@ -15,6 +16,15 @@ use crate::error::{AppError, AppResult};
 
 /// 记录自定义数据目录的指针文件名（存放在默认应用数据目录下）
 const DATA_DIR_POINTER_FILE: &str = "data_dir.conf";
+
+/// 同步状态（前端通过 sync://status 事件实时感知）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStatus {
+    /// idle | pending | syncing | synced | error
+    pub state: String,
+    pub message: String,
+}
 
 pub struct AppState {
     pub db: Mutex<Connection>,
@@ -36,6 +46,12 @@ pub struct AppState {
     pub push_lock: Mutex<()>,
     /// 待推送标记：数据变更落库后置 true，后台推送线程消费
     pub auto_push_pending: Mutex<bool>,
+    /// 前端事件发射所需的 AppHandle（setup 时注入，供同步线程向前端推事件）
+    pub app_handle: Mutex<Option<tauri::AppHandle>>,
+    /// 当前同步状态（内存副本 + 推送给前端）
+    pub sync_status: Mutex<SyncStatus>,
+    /// 自动同步开关（设置页可切换）
+    pub sync_auto: Mutex<bool>,
 }
 
 /// 解析最终数据目录：默认目录下存在指针文件（自定义位置）则优先使用；
@@ -64,6 +80,9 @@ pub fn init(data_dir: PathBuf) -> AppResult<AppState> {
     let repo_url = meta::get(&conn, "sync.repo_url")?.unwrap_or_default();
     let branch = meta::get(&conn, "sync.branch")?.unwrap_or_else(|| "main".into());
     let git_proxy = meta::get(&conn, "sync.git_proxy")?.unwrap_or_default();
+    let sync_auto = meta::get(&conn, "sync.auto")?
+        .map(|v| v != "false")
+        .unwrap_or(true);
 
     Ok(AppState {
         db: Mutex::new(conn),
@@ -77,6 +96,12 @@ pub fn init(data_dir: PathBuf) -> AppResult<AppState> {
         git_proxy: Mutex::new(git_proxy),
         push_lock: Mutex::new(()),
         auto_push_pending: Mutex::new(false),
+        app_handle: Mutex::new(None),
+        sync_status: Mutex::new(SyncStatus {
+            state: "idle".into(),
+            message: "等待同步".into(),
+        }),
+        sync_auto: Mutex::new(sync_auto),
     })
 }
 
@@ -275,6 +300,9 @@ impl AppState {
         *self.branch.lock().unwrap() =
             meta::get(&conn, "sync.branch")?.unwrap_or_else(|| "main".into());
         *self.git_proxy.lock().unwrap() = meta::get(&conn, "sync.git_proxy")?.unwrap_or_default();
+        *self.sync_auto.lock().unwrap() = meta::get(&conn, "sync.auto")?
+            .map(|v| v != "false")
+            .unwrap_or(true);
         drop(conn);
 
         // 写入指针文件，下次启动自动使用新位置

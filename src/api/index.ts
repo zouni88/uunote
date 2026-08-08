@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Account, DocumentItem, Note, SyncConfig } from "../types";
+import type { Account, DocumentItem, Note, NoteGroup, SyncConfig, SyncStatus } from "../types";
 
 /** 安全模式：设置/解锁主密码 */
 export async function setupMasterPassword(password: string): Promise<boolean> {
@@ -25,10 +25,20 @@ export async function changeMasterPassword(
 /** 笔记 */
 export const notesApi = {
   list: () => invoke<Note[]>("list_notes"),
-  create: (title: string) => invoke<Note>("create_note", { title }),
+  create: (title: string, groupId?: string) =>
+    invoke<Note>("create_note", { title, groupId }),
   update: (note: Note) => invoke<Note>("update_note", { note }),
   delete: (id: string) => invoke<void>("delete_note", { id }),
   togglePinned: (id: string) => invoke<Note>("toggle_pin_note", { id }),
+};
+
+/** 笔记分组 */
+export const groupsApi = {
+  list: () => invoke<NoteGroup[]>("list_groups"),
+  create: (title: string) => invoke<NoteGroup>("create_group", { title }),
+  rename: (id: string, title: string) =>
+    invoke<NoteGroup | null>("rename_group", { id, title }),
+  delete: (id: string) => invoke<void>("delete_group", { id }),
 };
 
 /** 账号 */
@@ -51,11 +61,22 @@ export const documentsApi = {
 /** 同步 */
 export const syncApi = {
   config: () => invoke<SyncConfig | null>("get_sync_config"),
-  saveConfig: (repoUrl: string, token: string, branch: string, gitProxy: string) =>
-    invoke<void>("save_sync_config", { repoUrl, token, branch, gitProxy }),
+  saveConfig: (
+    repoUrl: string,
+    token: string,
+    branch: string,
+    gitProxy: string,
+    autoSync: boolean
+  ) => invoke<void>("save_sync_config", { repoUrl, token, branch, gitProxy, autoSync }),
   push: () => invoke<string>("sync_push"),
   pull: () => invoke<string>("sync_pull"),
   auto: () => invoke<string>("sync_auto"),
+  /** 当前同步状态 */
+  status: () => invoke<SyncStatus>("get_sync_status"),
+  /** 切换自动同步 */
+  setAutoSync: (enabled: boolean) => invoke<void>("set_auto_sync", { enabled }),
+  /** 立即同步 */
+  now: () => invoke<string>("sync_now"),
 };
 
 /** 数据存储位置 */

@@ -8,6 +8,7 @@ use super::err;
 use crate::crypto;
 use crate::db::accounts;
 use crate::error::{AppError, AppResult};
+use crate::sync;
 
 /// 前端展示的账号（密码为明文）
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +90,9 @@ pub fn create_account(app: tauri::AppHandle, account: AccountInput) -> Result<Ac
     let db_acc = account.to_db(&key).map_err(err)?;
     let conn = st.db.lock().unwrap();
     let created = accounts::create(&conn, &db_acc).map_err(err)?;
+    drop(conn);
+    // 后台静默同步
+    sync::auto_commit(st);
     to_dto(&created, &key).map_err(err)
 }
 
@@ -99,6 +103,9 @@ pub fn update_account(app: tauri::AppHandle, account: AccountInput) -> Result<Ac
     let db_acc = account.to_db(&key).map_err(err)?;
     let conn = st.db.lock().unwrap();
     let updated = accounts::update(&conn, &db_acc).map_err(err)?;
+    drop(conn);
+    // 后台静默同步
+    sync::auto_commit(st);
     to_dto(&updated, &key).map_err(err)
 }
 
@@ -107,5 +114,9 @@ pub fn delete_account(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let st = super::state(&app);
     st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
-    accounts::delete(&conn, &id).map_err(err)
+    accounts::delete(&conn, &id).map_err(err)?;
+    drop(conn);
+    // 后台静默同步
+    sync::auto_commit(st);
+    Ok(())
 }

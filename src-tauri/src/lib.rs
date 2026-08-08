@@ -22,6 +22,9 @@ pub fn run() {
             let data_dir = state::resolve_data_dir(&app.path().app_data_dir()?)?;
             let state = Arc::new(state::init(data_dir)?);
             app.manage(state);
+            // 注入 AppHandle：后台同步线程据此向前端推送 sync://status、sync://changed 事件
+            let st = app.state::<Arc<AppState>>().inner().clone();
+            *st.app_handle.lock().unwrap() = Some(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -35,6 +38,10 @@ pub fn run() {
             commands::notes::update_note,
             commands::notes::delete_note,
             commands::notes::toggle_pin_note,
+            commands::groups::list_groups,
+            commands::groups::create_group,
+            commands::groups::rename_group,
+            commands::groups::delete_group,
             commands::accounts::list_accounts,
             commands::accounts::create_account,
             commands::accounts::update_account,
@@ -45,6 +52,9 @@ pub fn run() {
             commands::documents::export_document,
             commands::sync::get_sync_config,
             commands::sync::save_sync_config,
+            commands::sync::get_sync_status,
+            commands::sync::set_auto_sync,
+            commands::sync::sync_now,
             commands::sync::sync_push,
             commands::sync::sync_pull,
             commands::sync::sync_auto,
