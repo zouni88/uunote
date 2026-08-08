@@ -1,0 +1,48 @@
+[package]
+name = "uunote"
+version = "0.1.0"
+description = "个人笔记、账号与重要资料管理桌面软件"
+authors = ["zouni"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "uunote_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+
+# 本地加密数据库（bundled 免系统依赖）
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 内嵌 Git，实现 GitHub 私人库同步（无需系统安装 git）
+git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl", "https"] }
+
+# Token 存 Windows 凭据管理器
+keyring = { version = "3", features = ["windows-native"] }
+
+# 读取 Windows 系统代理设置（Internet Options），让 git 自动走系统代理
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+# 主密码密钥派生与数据加密
+argon2 = "0.5"
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"

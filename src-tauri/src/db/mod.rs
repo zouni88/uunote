@@ -1,0 +1,101 @@
+//! 本地 SQLite 数据库：连接管理、建表与通用辅助
+
+pub mod accounts;
+pub mod documents;
+pub mod meta;
+pub mod notes;
+
+use std::path::Path;
+
+use rusqlite::Connection;
+use rusqlite::OpenFlags;
+
+use crate::error::AppResult;
+
+/// 打开数据库并初始化表结构
+pub fn open(db_path: &Path) -> AppResult<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    init_schema(&conn)?;
+    Ok(conn)
+}
+
+fn init_schema(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS notes (
+            id         TEXT PRIMARY KEY,
+            title      TEXT NOT NULL,
+            blocks     TEXT NOT NULL DEFAULT '',
+            pinned     INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS accounts (
+            id            TEXT PRIMARY KEY,
+            title         TEXT NOT NULL,
+            username      TEXT NOT NULL DEFAULT '',
+            password_enc  TEXT NOT NULL DEFAULT '',
+            url           TEXT NOT NULL DEFAULT '',
+            notes         TEXT NOT NULL DEFAULT '',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS documents (
+            id         TEXT PRIMARY KEY,
+            title      TEXT NOT NULL,
+            file_name  TEXT NOT NULL,
+            file_path  TEXT NOT NULL,
+            size       INTEGER NOT NULL DEFAULT 0,
+            mime       TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        "#,
+    )?;
+    migrate(conn)?;
+    Ok(())
+}
+
+/// 老库升级：旧版笔记为"文字/画布"双模式结构（content/canvas_elements/note_type），
+/// 已废弃作废。整体重建为单一自由画布结构（blocks），旧内容不迁移。
+fn migrate(conn: &Connection) -> AppResult<()> {
+    let has_col = |name: &str| -> bool {
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(notes)")
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                rows.collect()
+            })
+            .unwrap_or_default();
+        cols.iter().any(|c| c == name)
+    };
+    if has_col("content") || has_col("canvas_elements") || has_col("note_type") {
+        conn.execute_batch(
+            "ALTER TABLE notes RENAME TO notes_legacy;
+             CREATE TABLE notes (
+                id         TEXT PRIMARY KEY,
+                title      TEXT NOT NULL,
+                blocks     TEXT NOT NULL DEFAULT '',
+                pinned     INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             INSERT INTO notes (id, title, blocks, pinned, created_at, updated_at)
+                SELECT id, title, '', pinned, created_at, updated_at FROM notes_legacy;
+             DROP TABLE notes_legacy;",
+        )?;
+    }
+    Ok(())
+}
