@@ -7,7 +7,6 @@ use crate::sync;
 #[tauri::command]
 pub fn list_notes(app: tauri::AppHandle) -> Result<Vec<Note>, String> {
     let st = super::state(&app);
-    st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
     notes::list(&conn).map_err(err)
 }
@@ -20,7 +19,6 @@ pub fn create_note(
     mode: Option<String>,
 ) -> Result<Note, String> {
     let st = super::state(&app);
-    st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
     let note = notes::create(&conn, &title, mode.as_deref().unwrap_or("freeform"), group_id).map_err(err)?;
     drop(conn);
@@ -38,7 +36,6 @@ pub fn update_note(app: tauri::AppHandle, note: Note) -> Result<Note, String> {
         note.content.len()
     );
     let st = super::state(&app);
-    st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
     let updated = notes::update(&conn, &note).map_err(err)?;
     drop(conn);
@@ -55,7 +52,6 @@ pub fn update_note(app: tauri::AppHandle, note: Note) -> Result<Note, String> {
 #[tauri::command]
 pub fn delete_note(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let st = super::state(&app);
-    st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
     notes::delete(&conn, &id).map_err(err)?;
     drop(conn);
@@ -67,7 +63,6 @@ pub fn delete_note(app: tauri::AppHandle, id: String) -> Result<(), String> {
 #[tauri::command]
 pub fn toggle_pin_note(app: tauri::AppHandle, id: String) -> Result<Option<Note>, String> {
     let st = super::state(&app);
-    st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
     let updated = notes::toggle_pin(&conn, &id).map_err(err)?;
     drop(conn);

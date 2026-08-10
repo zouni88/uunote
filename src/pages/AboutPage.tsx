@@ -8,19 +8,19 @@ const features: { title: string; desc: string }[] = [
   },
   {
     title: "账号（密码管理）",
-    desc: "各类登录信息加密存储，密码可显示/隐藏，支持快速检索定位。",
+    desc: "登录密码用主密钥加密存储，密码可显示/隐藏，支持快速检索定位。",
   },
   {
     title: "重要资料（文件保险箱）",
-    desc: "任意类型文件加密保存，导入时自动加密、导出时自动解密。",
+    desc: "任意类型文件直接保存，导入即用，导出无需解锁。",
   },
   {
     title: "GitHub 云同步（可选）",
-    desc: "数据加密后同步到自己的 GitHub 私人仓库，云端只见密文，也可纯本地使用。",
+    desc: "数据自动同步到自己的 GitHub 私人仓库，账号密码加密存储，也可纯本地使用。",
   },
   {
-    title: "端到端加密",
-    desc: "Argon2id 密钥派生 + AES-256-GCM 加密，主密钥只存内存，从不写入磁盘。",
+    title: "密码加密",
+    desc: "账号密码用 Argon2id 密钥派生 + AES-256-GCM 加密，主密钥只存内存，从不写入磁盘。",
   },
   {
     title: "数据迁移",
@@ -52,7 +52,7 @@ export default function AboutPage() {
         <h2>UUNote</h2>
         {version && <p className="about-version">版本 {version}</p>}
         <p className="about-slogan">
-          本地加密的笔记 / 账号 / 重要资料管理工具，数据只属于你自己。
+          本地的笔记 / 账号 / 重要资料管理工具，数据只属于你自己。
         </p>
       </div>
 
@@ -60,7 +60,7 @@ export default function AboutPage() {
         <h3>关于 UUNote</h3>
         <p>
           UUNote 是一款完全本地运行的桌面笔记软件。所有数据——笔记、账号密码、重要资料文件——都保存在你自己的电脑上，
-          不经过任何第三方服务器。可选地把加密后的数据同步到你的 GitHub 私人仓库，用于多设备备份，全程加密，云端看不到任何明文。
+          不经过任何第三方服务器。可选地把数据同步到你的 GitHub 私人仓库，用于多设备备份，账号密码始终加密存储。
         </p>
       </section>
 

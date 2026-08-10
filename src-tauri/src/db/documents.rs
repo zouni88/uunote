@@ -12,11 +12,12 @@ use crate::db::outbox;
 use crate::error::AppResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Document {
     pub id: String,
     pub title: String,
     pub file_name: String,
-    /// vault 目录内的加密文件名（相对）
+    /// vault 目录内的文件名（相对）
     pub file_path: String,
     pub size: i64,
     pub mime: String,

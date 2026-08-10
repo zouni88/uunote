@@ -22,6 +22,11 @@ export async function isAppLocked(): Promise<boolean> {
   return invoke("is_app_locked");
 }
 
+/** 是否已设置过主密码（区分「首次使用需设置」与「已设置需解锁」） */
+export async function hasMasterPassword(): Promise<boolean> {
+  return invoke("has_master_password");
+}
+
 /** 修改主密码：验证旧密码后重加密全部敏感数据 */
 export async function changeMasterPassword(
   oldPassword: string,

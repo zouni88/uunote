@@ -2023,7 +2023,7 @@ export default function FreeformEditor({
       <div className="ff-toolbar">
         <div className="ff-mode-group">
           <button
-            className={mode === "text" ? "ff-btn active" : "ff-btn"}
+            className={mode === "text" ? "ff-btn ff-icon-btn active" : "ff-btn ff-icon-btn"}
             onClick={() => setMode("text")}
             title="文字：点击画布任意位置直接输入"
           >
@@ -2032,20 +2032,18 @@ export default function FreeformEditor({
               <path d="M12 6v13" />
               <path d="M9.5 19h5" />
             </svg>
-            文字
           </button>
           <button
-            className={mode === "select" ? "ff-btn active" : "ff-btn"}
+            className={mode === "select" ? "ff-btn ff-icon-btn active" : "ff-btn ff-icon-btn"}
             onClick={() => setMode("select")}
             title="选择：框选 / 拖动已有内容"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M5 3l14 8.5-5.5 1.2L10.5 18 8 21z" />
             </svg>
-            选择
           </button>
           <button
-            className={mode === "draw" ? "ff-btn active" : "ff-btn"}
+            className={mode === "draw" ? "ff-btn ff-icon-btn active" : "ff-btn ff-icon-btn"}
             onClick={() => setMode("draw")}
             title="画笔：在画布上自由涂鸦"
           >
@@ -2053,10 +2051,9 @@ export default function FreeformEditor({
               <path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 0 1 3 3L8 19z" />
               <path d="M13.5 6.5l4 4" />
             </svg>
-            画笔
           </button>
           <button
-            className="ff-btn"
+            className="ff-btn ff-icon-btn"
             onClick={() => fileRef.current?.click()}
             title="插入图片（也可 Ctrl+V 粘贴截图）"
           >
@@ -2065,10 +2062,9 @@ export default function FreeformEditor({
               <circle cx="8.5" cy="10" r="1.5" />
               <path d="M21 15l-5-5-8 8" />
             </svg>
-            图片
           </button>
           <button
-            className="ff-btn"
+            className="ff-btn ff-icon-btn"
             onClick={() => insertTableFromCaret()}
             title="插入表格（光标在文字里时内嵌，否则放在点击处）"
           >
@@ -2078,7 +2074,6 @@ export default function FreeformEditor({
               <path d="M3 16h18" />
               <path d="M9.5 4v16" />
             </svg>
-            表格
           </button>
           <input
             ref={fileRef}

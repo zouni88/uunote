@@ -4,10 +4,18 @@ import WindowControls from "./WindowControls";
 
 interface LockScreenProps {
   onUnlocked: () => void;
+  /** 嵌入页面内显示（隐藏窗口控制，标题栏已提供） */
+  embedded?: boolean;
+  /** 初始模式：区分首次设置与解锁 */
+  initialMode?: "unlock" | "setup";
 }
 
-export default function LockScreen({ onUnlocked }: LockScreenProps) {
-  const [mode, setMode] = useState<"unlock" | "setup">("unlock");
+export default function LockScreen({
+  onUnlocked,
+  embedded,
+  initialMode = "unlock",
+}: LockScreenProps) {
+  const [mode, setMode] = useState<"unlock" | "setup">(initialMode);
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
@@ -42,15 +50,19 @@ export default function LockScreen({ onUnlocked }: LockScreenProps) {
   }
 
   return (
-    <div className="lock-screen" data-tauri-drag-region="deep">
-      <div className="lock-winctrl">
-        <WindowControls />
-      </div>
+    <div className="lock-screen">
+      {!embedded && (
+        <div className="lock-winctrl">
+          <WindowControls />
+        </div>
+      )}
       <div className="lock-card">
         <div className="lock-brand">
           <span className="brand-logo">U</span> UUNote
         </div>
-        <p className="lock-sub">你的加密笔记 · 账号 · 资料管家</p>
+        <p className="lock-sub">
+          {embedded ? "账号密码加密保存，输入主密码解锁后查看" : "你的加密笔记 · 账号 · 资料管家"}
+        </p>
         <div className="lock-tabs">
           <button
             className={mode === "unlock" ? "active" : ""}

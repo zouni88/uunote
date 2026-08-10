@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { accountsApi } from "../api";
+import { accountsApi, hasMasterPassword, isAppLocked } from "../api";
 import type { Account } from "../types";
 import { toast, toastUndo } from "../components/Toaster";
 import { consumePendingNavigate } from "../lib/events";
+import LockScreen from "../components/LockScreen";
 
 const emptyForm: Omit<Account, "id" | "createdAt" | "updatedAt"> = {
   title: "",
@@ -13,6 +14,9 @@ const emptyForm: Omit<Account, "id" | "createdAt" | "updatedAt"> = {
 };
 
 export default function AccountsPage() {
+  // 进入门：checking=检查锁定状态 / locked=需解锁 / open=已解锁可查看
+  const [gate, setGate] = useState<"checking" | "locked" | "open">("checking");
+  const [unlockMode, setUnlockMode] = useState<"unlock" | "setup">("unlock");
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [form, setForm] = useState(emptyForm);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -32,8 +36,28 @@ export default function AccountsPage() {
   }
 
   useEffect(() => {
-    refresh();
+    (async () => {
+      try {
+        const locked = await isAppLocked();
+        if (!locked) {
+          setGate("open");
+          refresh();
+          return;
+        }
+        // 已设置主密码 → 解锁；否则首次使用 → 设置主密码
+        setUnlockMode((await hasMasterPassword()) ? "unlock" : "setup");
+        setGate("locked");
+      } catch {
+        setGate("open");
+        refresh();
+      }
+    })();
   }, []);
+
+  function handleUnlocked() {
+    setGate("open");
+    refresh();
+  }
 
   function handleSelect(acc: Account) {
     setEditingId(acc.id);
@@ -102,6 +126,17 @@ export default function AccountsPage() {
       console.error(e);
       toast("恢复失败", { kind: "error" });
     }
+  }
+
+  /** 进入账号页需解锁：未解锁时展示锁屏（嵌入页面内） */
+  if (gate === "locked") {
+    return (
+      <LockScreen
+        embedded
+        initialMode={unlockMode}
+        onUnlocked={handleUnlocked}
+      />
+    );
   }
 
   if (loading) {

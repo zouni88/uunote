@@ -210,13 +210,13 @@ export default function SettingsPage() {
       <section className="settings-section">
         <h3>云同步</h3>
         <p className="settings-hint">
-          数据加密后自动同步到你的 GitHub 私人仓库，多设备间自动合并，无需手动操作。
+          数据自动同步到你的 GitHub 私人仓库（账号密码加密存储），多设备间自动合并，无需手动操作。
         </p>
 
         <div className="sync-row">
           <div className="sync-row-info">
             <div className="sync-row-title">自动同步</div>
-            <div className="settings-hint">有变更时自动保存到云端，新设备解锁后自动拉取</div>
+            <div className="settings-hint">有变更时自动保存到云端，启动即同步，无需解锁</div>
           </div>
           <button
             className={`toggle ${autoSync ? "on" : ""}`}
@@ -298,7 +298,7 @@ export default function SettingsPage() {
       <section className="settings-section">
         <h3>数据存储位置</h3>
         <p className="settings-hint">
-          所有数据（数据库、加密资料、同步仓库）默认保存在系统盘（C
+          所有数据（数据库、资料、同步仓库）默认保存在系统盘（C
           盘）。可更改到其它磁盘，避免占用系统盘空间。
         </p>
         <div className="form-field">
@@ -319,7 +319,7 @@ export default function SettingsPage() {
       <section className="settings-section">
         <h3>修改主密码</h3>
         <p className="settings-hint">
-          修改后本地全部数据（账号密码、加密资料）会用新密码重新加密，之后请用新密码解锁。
+          修改后账号密码会用新密码重新加密，之后请用新密码解锁账号页。
         </p>
         <div className="form-field">
           <label>原密码</label>

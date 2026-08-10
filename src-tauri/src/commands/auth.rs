@@ -14,12 +14,9 @@ pub fn setup_master_password(app: tauri::AppHandle, password: String) -> Result<
 #[tauri::command]
 pub fn unlock_app(app: tauri::AppHandle, password: String) -> Result<bool, String> {
     let st = super::state(&app);
+    // 后台自动同步已在应用启动时开启（同步为明文，无需解锁）
     match st.unlock(&password) {
-        Ok(()) => {
-            // 解锁成功后启动后台自动同步循环（静默拉取 + 推送）
-            crate::sync::start_background_sync(st);
-            Ok(true)
-        }
+        Ok(()) => Ok(true),
         Err(_) => Ok(false),
     }
 }
@@ -28,6 +25,14 @@ pub fn unlock_app(app: tauri::AppHandle, password: String) -> Result<bool, Strin
 pub fn is_app_locked(app: tauri::AppHandle) -> Result<bool, String> {
     let st = super::state(&app);
     Ok(st.is_locked())
+}
+
+/// 是否已设置过主密码（用于区分「首次使用需设置」与「已设置需解锁」）
+#[tauri::command]
+pub fn has_master_password(app: tauri::AppHandle) -> Result<bool, String> {
+    let st = super::state(&app);
+    let conn = st.db.lock().unwrap();
+    Ok(crate::db::meta::get(&conn, "salt").map_err(err)?.is_some())
 }
 
 #[tauri::command]

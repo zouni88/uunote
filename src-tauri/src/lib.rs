@@ -32,12 +32,15 @@ pub fn run() {
             // 注入 AppHandle：后台同步线程据此向前端推送 sync://status、sync://changed 事件
             let st = app.state::<Arc<AppState>>().inner().clone();
             *st.app_handle.lock().unwrap() = Some(app.handle().clone());
+            // 启动即开启后台自动同步（笔记/资料为明文，无需解锁）
+            sync::start_background_sync(st);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::auth::setup_master_password,
             commands::auth::unlock_app,
             commands::auth::is_app_locked,
+            commands::auth::has_master_password,
             commands::auth::lock_app,
             commands::auth::change_master_password,
             commands::notes::list_notes,
@@ -77,7 +80,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(st) = app.try_state::<Arc<AppState>>() {
                     let st = st.inner().clone();
-                    if !st.is_locked() && !st.repo_url.lock().unwrap().is_empty() {
+                    if !st.repo_url.lock().unwrap().is_empty() {
                         let _ = sync::push(&st);
                     }
                 }

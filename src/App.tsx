@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import Titlebar from "./components/Titlebar";
-import LockScreen from "./components/LockScreen";
 import Toaster from "./components/Toaster";
 import CommandPalette from "./components/CommandPalette";
 import NotesPage from "./pages/NotesPage";
@@ -8,7 +7,6 @@ import AccountsPage from "./pages/AccountsPage";
 import DocumentsPage from "./pages/DocumentsPage";
 import SettingsPage from "./pages/SettingsPage";
 import AboutPage from "./pages/AboutPage";
-import { isAppLocked } from "./api";
 import { on } from "./lib/events";
 import { watchSystemTheme } from "./lib/theme";
 import type { NavigateTarget } from "./lib/events";
@@ -17,12 +15,7 @@ import "./App.css";
 
 export default function App() {
   const [page, setPage] = useState<PageKey>("notes");
-  const [locked, setLocked] = useState<boolean | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
-
-  useEffect(() => {
-    isAppLocked().then(setLocked);
-  }, []);
 
   // 跟随系统时监听系统配色变化（由 lib/theme 统一处理并应用）
   useEffect(() => watchSystemTheme(), []);
@@ -47,9 +40,6 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
-
-  if (locked === null) return <div className="app-loading">启动中…</div>;
-  if (locked) return <LockScreen onUnlocked={() => setLocked(false)} />;
 
   return (
     <div className="app-shell">

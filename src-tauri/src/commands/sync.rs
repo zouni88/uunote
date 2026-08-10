@@ -12,7 +12,6 @@ use crate::sync::{self, SyncConfig};
 #[tauri::command]
 pub fn get_sync_config(app: tauri::AppHandle) -> Result<Option<SyncConfig>, String> {
     let st = super::state(&app);
-    st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
     sync::get_config(&conn).map_err(err)
 }
@@ -27,7 +26,6 @@ pub fn save_sync_config(
     auto_sync: bool,
 ) -> Result<(), String> {
     let st = super::state(&app);
-    st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
     sync::save_config(&conn, &repo_url, &branch, &token, &git_proxy).map_err(err)?;
     meta::set(&conn, "sync.auto", if auto_sync { "true" } else { "false" }).map_err(err)?;
@@ -51,7 +49,6 @@ pub fn get_sync_status(app: tauri::AppHandle) -> Result<crate::state::SyncStatus
 #[tauri::command]
 pub fn set_auto_sync(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     let st = super::state(&app);
-    st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
     meta::set(&conn, "sync.auto", if enabled { "true" } else { "false" }).map_err(err)?;
     *st.sync_auto.lock().unwrap() = enabled;
@@ -68,7 +65,6 @@ pub async fn sync_now(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 fn push_sync(st: &crate::state::AppState) -> Result<String, String> {
-    st.master_key().map_err(err)?;
     sync::push(st).map_err(err)
 }
 
@@ -89,7 +85,6 @@ pub async fn sync_pull(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 fn pull_sync(st: &crate::state::AppState) -> Result<String, String> {
-    st.master_key().map_err(err)?;
     sync::pull(st).map_err(err)
 }
 
@@ -102,6 +97,5 @@ pub async fn sync_auto(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 fn auto_sync(st: &crate::state::AppState) -> Result<String, String> {
-    st.master_key().map_err(err)?;
     sync::auto_sync(st).map_err(err)
 }

@@ -28,13 +28,11 @@ pub struct SyncStatus {
 
 pub struct AppState {
     pub db: Mutex<Connection>,
-    /// 解锁后持有的主密钥，仅存内存，从不落盘
+    /// 解锁后持有的主密钥，仅存内存，从不落盘（仅用于账号密码字段加解密）
     master_key: Mutex<Option<[u8; crypto::KEY_LEN]>>,
-    /// 解锁后持有的主密码明文（仅存内存），用于从快照公开盐派生快照密钥
-    master_password: Mutex<Option<String>>,
     /// 当前数据目录（数据库、vault、sync 的父目录）
     pub data_dir: Mutex<PathBuf>,
-    /// 加密资料文件本体存放目录
+    /// 资料文件本体存放目录（明文）
     pub vault_dir: Mutex<PathBuf>,
     /// Git 同步工作目录
     pub sync_dir: Mutex<PathBuf>,
@@ -87,7 +85,6 @@ pub fn init(data_dir: PathBuf) -> AppResult<AppState> {
     Ok(AppState {
         db: Mutex::new(conn),
         master_key: Mutex::new(None),
-        master_password: Mutex::new(None),
         data_dir: Mutex::new(data_dir),
         vault_dir: Mutex::new(vault_dir),
         sync_dir: Mutex::new(sync_dir),
@@ -116,20 +113,6 @@ impl AppState {
         guard.as_ref().copied().ok_or(AppError::Locked)
     }
 
-    /// 取解锁后的主密码（仅内存），用于从快照公开盐派生快照密钥
-    pub fn master_password(&self) -> AppResult<String> {
-        self.master_password
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(AppError::Locked)
-    }
-
-    /// 导入快照后切换内存主密钥（本地解锁信息已同步为快照密钥体系）
-    pub fn set_master_key(&self, key: [u8; crypto::KEY_LEN]) {
-        *self.master_key.lock().unwrap() = Some(key);
-    }
-
     /// 首次使用：生成盐、派生密钥、存魔术串
     pub fn setup_master_password(&self, password: &str) -> AppResult<()> {
         let conn = self.db.lock().unwrap();
@@ -142,7 +125,6 @@ impl AppState {
         meta::set(&conn, "salt", &crypto::to_b64(&salt))?;
         meta::set(&conn, "master_magic", &magic)?;
         *self.master_key.lock().unwrap() = Some(key);
-        *self.master_password.lock().unwrap() = Some(password.to_string());
         Ok(())
     }
 
@@ -159,17 +141,15 @@ impl AppState {
             return Err(AppError::BadPassword);
         }
         *self.master_key.lock().unwrap() = Some(key);
-        *self.master_password.lock().unwrap() = Some(password.to_string());
         Ok(())
     }
 
     pub fn lock(&self) {
         *self.master_key.lock().unwrap() = None;
-        *self.master_password.lock().unwrap() = None;
     }
 
-    /// 修改主密码：验证旧密码后，重新派生密钥并重加密全部敏感数据
-    /// （账号密码密文、vault 资料文件），最后更新 salt 与魔术串。
+    /// 修改主密码：验证旧密码后，重新派生密钥并重加密账号密码密文，
+    /// 最后更新 salt 与魔术串（资料文件已改为明文存储，无需重加密）。
     pub fn change_master_password(&self, old_password: &str, new_password: &str) -> AppResult<()> {
         if new_password.is_empty() {
             return Err(AppError::other("新密码不能为空"));
@@ -188,22 +168,12 @@ impl AppState {
         let new_salt = crypto::generate_salt();
         let new_key = crypto::derive_key(new_password, &new_salt)?;
 
-        // 预检：确认全部敏感数据都能用旧密钥解密，避免迁移中途失败损坏数据
+        // 预检：确认全部账号密码密文都能用旧密钥解密，避免迁移中途失败损坏数据
         let acc_list = accounts::list(&conn)?;
         for a in &acc_list {
             if !a.password_enc.is_empty() {
                 let data = crypto::from_b64(&a.password_enc)?;
                 crypto::decrypt(&old_key, &data)?;
-            }
-        }
-        let vault_dir = self.vault_dir.lock().unwrap().clone();
-        let mut enc_files = Vec::new();
-        for entry in std::fs::read_dir(&vault_dir)? {
-            let entry = entry?;
-            if entry.path().extension().and_then(|e| e.to_str()) == Some("enc") {
-                let encrypted = std::fs::read(entry.path())?;
-                crypto::decrypt(&old_key, &encrypted)?;
-                enc_files.push(entry.path());
             }
         }
         drop(conn);
@@ -237,19 +207,8 @@ impl AppState {
         tx.commit()?;
         drop(conn);
 
-        // 重加密 vault 资料文件（先写临时文件再替换，避免写坏）
-        for path in &enc_files {
-            let encrypted = std::fs::read(path)?;
-            let plain = crypto::decrypt(&old_key, &encrypted)?;
-            let new_enc = crypto::encrypt(&new_key, &plain)?;
-            let tmp = path.with_extension("enc.tmp");
-            std::fs::write(&tmp, &new_enc)?;
-            std::fs::rename(&tmp, path)?;
-        }
-
-        // 更新内存中的主密钥与主密码
+        // 更新内存中的主密钥
         *self.master_key.lock().unwrap() = Some(new_key);
-        *self.master_password.lock().unwrap() = Some(new_password.to_string());
         Ok(())
     }
 
