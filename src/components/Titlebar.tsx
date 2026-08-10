@@ -93,11 +93,12 @@ export default function Titlebar({ page, onOpenPalette }: TitlebarProps) {
     <header className="titlebar" data-tauri-drag-region="deep">
       <div className="tb-page-switcher" ref={switcherRef}>
         <button
-          className="tb-btn tb-page-icon"
-          title={pageLabels[page]}
+          className="tb-btn tb-brand"
+          title="UUNote"
           onClick={() => setMenuOpen((v) => !v)}
         >
-          {pageIcons[page]}
+          <img className="tb-brand-logo" src="/uunote.png" alt="UUNote" draggable={false} />
+          <span className="tb-brand-name">UUNote</span>
         </button>
         {menuOpen && (
           <div className="tb-page-menu">

@@ -196,15 +196,31 @@ textarea {
   height: 17px;
 }
 
-/* 左侧：当前页面图标 + 页面切换菜单 */
+/* 左侧：品牌 Logo + 页面切换菜单 */
 .tb-page-switcher {
   position: relative;
   margin-right: 2px;
 }
 
-.tb-page-icon svg {
-  width: 18px;
-  height: 18px;
+.tb-brand {
+  gap: 7px;
+  padding: 0 9px 0 3px;
+  width: auto;
+}
+
+.tb-brand-logo {
+  width: 22px;
+  height: 22px;
+  object-fit: contain;
+  display: block;
+  flex-shrink: 0;
+}
+
+.tb-brand-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.2px;
 }
 
 .tb-page-menu {
@@ -1012,27 +1028,75 @@ textarea {
   background: transparent;
   caret-color: var(--text);
   cursor: text;
+  /* 空状态卡片 → 普通文本 的平滑过渡 */
+  transition:
+    background 0.18s ease,
+    padding 0.18s ease,
+    border-width 0.18s ease,
+    border-radius 0.18s ease,
+    box-shadow 0.18s ease;
 }
 
 .ff-text-editable:focus {
   background: var(--focus-tint);
 }
 
+/* ---------- 新建文字块：空状态输入框（OneNote 式） ----------
+ * 点击画布新建的空白文字块显示为最小宽度的虚线输入框（只有闪烁光标，
+ * 无占位文字）；框体宽度 = 块宽度，因此 X 按钮恒贴右上角。
+ * 一旦输入内容，ff-empty 类移除，自动恢复为透明文本与画布融为一体。 */
+.ff-text-editable.ff-empty {
+  position: relative;
+  padding: 5px 8px;
+  border: 1.5px dashed rgba(99, 102, 241, 0.55);
+  border-radius: 6px;
+  background: rgba(99, 102, 241, 0.06);
+  animation: ff-card-in 0.18s ease-out;
+}
+
+.ff-text-editable.ff-empty:focus {
+  border-color: var(--primary);
+  border-style: solid;
+}
+
+/* 空状态输入框自带边框，替代默认选中描边，避免双重边框 */
+.ff-block.ff-selected:has(.ff-text-editable.ff-empty) {
+  outline: none;
+}
+
+@keyframes ff-card-in {
+  from {
+    opacity: 0;
+    transform: scale(0.98) translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+/* OneNote 式顶部拖移条：整条覆盖块顶边，按住任意位置即可整体移动 */
 .ff-move-handle {
   position: absolute;
-  top: -16px;
+  top: -14px;
   left: 0;
-  height: 16px;
+  width: 100%;
+  height: 14px;
   display: flex;
   align-items: center;
-  padding: 0 6px;
-  font-size: 12px;
+  padding: 0 4px;
+  font-size: 11px;
+  line-height: 1;
   color: var(--text-secondary);
+  background: rgba(99, 102, 241, 0.08);
+  border-radius: 5px 5px 0 0;
   cursor: grab;
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.15s;
   user-select: none;
+  z-index: 5;
+  box-sizing: border-box;
 }
 
 .ff-block:hover .ff-move-handle,
@@ -1155,6 +1219,11 @@ textarea {
   touch-action: none;
 }
 
+/* 文字块宽度调整手柄（OneNote 式：只调列宽） */
+.ff-resize-w {
+  cursor: ew-resize;
+}
+
 .ff-delete {
   position: absolute;
   top: -14px;
@@ -1172,6 +1241,7 @@ textarea {
   line-height: 1;
   cursor: pointer;
   box-shadow: var(--shadow-sm);
+  z-index: 7; /* 盖过顶部拖移条，保证 X 可点击 */
 }
 
 .ff-delete:hover {

@@ -35,6 +35,8 @@ export interface FreeformBlock {
   height: number;
   /** text 块内容 */
   text?: string;
+  /** 手动调整过文字块宽度后锁定宽度（OneNote 式：不再随内容自动伸缩） */
+  manualWidth?: boolean;
   /** text 块字号（px） */
   fontSize?: number;
   /** text 块文字颜色 */

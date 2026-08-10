@@ -16,6 +16,7 @@ const PAGE_W = 2400;
 const PAGE_H = 1600;
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 3;
+/** 新建文字块的初始宽度（OneNote 式最小宽度，输入后自动扩展到内容） */
 const DEFAULT_TEXT_WIDTH = 120;
 const DEFAULT_COL_WIDTH = 120;
 const DEFAULT_FONT_SIZE = 16;
@@ -224,6 +225,8 @@ export default function FreeformEditor({
     startY: number;
     origW: number;
     origH: number;
+    /** 文字块只调宽度（OneNote 式：高度随内容） */
+    widthOnly?: boolean;
   } | null>(null);
   /** 表格列宽拖动 */
   const colResizeRef = useRef<{
@@ -364,6 +367,10 @@ export default function FreeformEditor({
           // 放大时不允许把块拉出画布右边界
           const maxW = Math.max(80, PAGE_W - b.x);
           const nw = Math.max(80, Math.min(maxW, Math.round(r.origW + dx)));
+          // 文字块：只调宽度并锁定（OneNote 式），高度始终随内容
+          if (b.type === "text" || r.widthOnly) {
+            return { ...b, width: nw, manualWidth: true };
+          }
           const scale = nw / r.origW;
           return { ...b, width: nw, height: Math.max(30, Math.round(r.origH * scale)) };
         });
@@ -407,6 +414,8 @@ export default function FreeformEditor({
     if (e.button !== 0) return;
     // 新一轮点击开始：此前创建块的标记失效（防止保护到已放弃的空框）
     lastCreatedRef.current = null;
+    // 点击画布即放弃所有空文字框（OneNote 式：不输入的空框不残留）
+    removeEmptyTextBlocks();
     const { x, y } = toPage(e.clientX, e.clientY);
     // 记住点击位置，供粘贴截图"点哪粘哪"使用
     lastClickRef.current = { x, y };
@@ -601,6 +610,8 @@ export default function FreeformEditor({
       startY: e.clientY,
       origW: block.width,
       origH: block.height,
+      // 文字块只调整宽度（OneNote 式：拖角落手柄变列宽，高度随内容）
+      widthOnly: block.type === "text",
     };
   };
 
@@ -658,6 +669,39 @@ export default function FreeformEditor({
     startDrag(e, block);
   };
 
+  /** 判断可编辑容器是否"视觉为空"（无文字/图片/内嵌表格，<br> 不算内容） */
+  const isEditableEmpty = (el: HTMLElement) =>
+    !el.querySelector("table, img") && !(el.textContent ?? "").replace(/\s/g, "");
+
+  /** 根据内容同步 ff-empty 类：空状态显示现代输入卡片，输入后自动转为透明文本 */
+  const syncEmptyState = (el: HTMLElement) => {
+    el.classList.toggle("ff-empty", isEditableEmpty(el));
+  };
+
+  /** 从 HTML 判断是否纯空白（移除标签与 &nbsp; 后无内容） */
+  const stripHtmlEmpty = (html: string) =>
+    html.replace(/<[^>]*>|&nbsp;/g, "").trim();
+
+  /** 移除画布上所有"视觉为空"的文字块（OneNote 式：放弃空框，点哪不留下框） */
+  const removeEmptyTextBlocks = () => {
+    const next = blocksRef.current.filter((b) => {
+      if (b.type !== "text") return true;
+      const el = document.querySelector(
+        `[data-block-id="${b.id}"] .ff-text-editable`,
+      ) as HTMLElement | null;
+      // DOM 可用时以实际内容为准（<br>/nbsp 也算空），否则回退到 block.text
+      if (el) return !isEditableEmpty(el);
+      return !!stripHtmlEmpty(b.text ?? "");
+    });
+    if (next.length !== blocksRef.current.length) applyBlocks(next);
+  };
+
+  /** 切换工具模式时先放弃空文字框（OneNote 式） */
+  const switchMode = (m: Mode) => {
+    removeEmptyTextBlocks();
+    setMode(m);
+  };
+
   /** 读取文字块 innerHTML 并同步数据、按内容自动加宽（支持块内内嵌图片） */
   const updateTextBlockFromEl = (blockId: string, el: HTMLElement) => {
     const html = el.innerHTML;
@@ -672,8 +716,11 @@ export default function FreeformEditor({
     el.style.width = prevW;
     const b = blocksRef.current.find((x) => x.id === blockId);
     const maxW = Math.max(80, PAGE_W - (b?.x ?? 0));
-    // 留一点余量，避免最后一个字符恰好换行
-    const width = Math.round(clamp(naturalW + 12, 80, maxW));
+    // 手动锁定宽度的文字块：保持原宽度（文字内部换行），不随内容自动伸缩
+    const width = b?.manualWidth
+      ? b.width
+      : Math.round(clamp(naturalW + 12, 80, maxW));
+    syncEmptyState(el);
     applyBlocks(
       blocksRef.current.map((bl) =>
         bl.id === blockId ? { ...bl, text: html, width } : bl,
@@ -1342,6 +1389,27 @@ export default function FreeformEditor({
   };
 
   const handleDeleteKey = (e: KeyboardEvent) => {
+    // Esc：取消选中 / 关闭正在编辑的空输入框（OneNote 式：空框消失、有内容仅取消选中）
+    if (e.key === "Escape") {
+      // 右键菜单开着时只关菜单（由菜单自己的监听处理），不动选区
+      if (contextMenu) return;
+      lastCreatedRef.current = null;
+      if (editingId) {
+        const active = document.activeElement as HTMLElement | null;
+        if (
+          active &&
+          (active.isContentEditable ||
+            (active.classList && active.classList.contains("ff-cell")))
+        ) {
+          // 空文字块 blur 时会被自动移除，非空块仅失焦、内容保留
+          active.blur();
+        }
+      }
+      setSelectedIds([]);
+      setSelectedId(null);
+      setEditingId(null);
+      return;
+    }
     if ((!selectedId && selectedIds.length === 0) || editingId) return;
     const t = e.target as HTMLElement | null;
     if (
@@ -2024,7 +2092,7 @@ export default function FreeformEditor({
         <div className="ff-mode-group">
           <button
             className={mode === "text" ? "ff-btn ff-icon-btn active" : "ff-btn ff-icon-btn"}
-            onClick={() => setMode("text")}
+            onClick={() => switchMode("text")}
             title="文字：点击画布任意位置直接输入"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -2035,7 +2103,7 @@ export default function FreeformEditor({
           </button>
           <button
             className={mode === "select" ? "ff-btn ff-icon-btn active" : "ff-btn ff-icon-btn"}
-            onClick={() => setMode("select")}
+            onClick={() => switchMode("select")}
             title="选择：框选 / 拖动已有内容"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -2044,7 +2112,7 @@ export default function FreeformEditor({
           </button>
           <button
             className={mode === "draw" ? "ff-btn ff-icon-btn active" : "ff-btn ff-icon-btn"}
-            onClick={() => setMode("draw")}
+            onClick={() => switchMode("draw")}
             title="画笔：在画布上自由涂鸦"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -2314,6 +2382,7 @@ export default function FreeformEditor({
                         if (el && !el.dataset.ready) {
                           el.dataset.ready = "1";
                           el.innerHTML = block.text ?? "";
+                          syncEmptyState(el);
                         }
                       }}
                       onInput={(e) => handleTextInput(block.id, e)}
@@ -2421,6 +2490,13 @@ export default function FreeformEditor({
                     <div
                       className="ff-resize"
                       title="调整大小"
+                      onPointerDown={(e) => startResize(e, block)}
+                    />
+                  )}
+                  {selected && primary && !block.locked && block.type === "text" && (
+                    <div
+                      className="ff-resize ff-resize-w"
+                      title="调整宽度"
                       onPointerDown={(e) => startResize(e, block)}
                     />
                   )}
