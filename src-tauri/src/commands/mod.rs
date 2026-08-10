@@ -5,6 +5,7 @@ pub mod auth;
 pub mod documents;
 pub mod groups;
 pub mod notes;
+pub mod settings;
 pub mod storage;
 pub mod sync;
 

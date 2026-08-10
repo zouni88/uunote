@@ -17,11 +17,12 @@ pub fn create_note(
     app: tauri::AppHandle,
     title: String,
     group_id: Option<String>,
+    mode: Option<String>,
 ) -> Result<Note, String> {
     let st = super::state(&app);
     st.master_key().map_err(err)?;
     let conn = st.db.lock().unwrap();
-    let note = notes::create(&conn, &title, group_id).map_err(err)?;
+    let note = notes::create(&conn, &title, mode.as_deref().unwrap_or("freeform"), group_id).map_err(err)?;
     drop(conn);
     // 自动提交并推送（后台静默执行）
     sync::auto_commit(st);
@@ -31,10 +32,10 @@ pub fn create_note(
 #[tauri::command]
 pub fn update_note(app: tauri::AppHandle, note: Note) -> Result<Note, String> {
     eprintln!(
-        "[notes] update id={} title={} blocks_len={}",
+        "[notes] update id={} title={} content_len={}",
         note.id,
         note.title,
-        note.blocks.len()
+        note.content.len()
     );
     let st = super::state(&app);
     st.master_key().map_err(err)?;
@@ -42,9 +43,9 @@ pub fn update_note(app: tauri::AppHandle, note: Note) -> Result<Note, String> {
     let updated = notes::update(&conn, &note).map_err(err)?;
     drop(conn);
     eprintln!(
-        "[notes] updated id={} blocks_len={}",
+        "[notes] updated id={} content_len={}",
         updated.id,
-        updated.blocks.len()
+        updated.content.len()
     );
     // 自动提交并推送（后台静默执行）
     sync::auto_commit(st);

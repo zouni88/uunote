@@ -1,5 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Account, DocumentItem, Note, NoteGroup, SyncConfig, SyncStatus } from "../types";
+import type {
+  Account,
+  DocumentItem,
+  Note,
+  NoteGroup,
+  SyncConfig,
+  SyncStatus,
+  ThemeMode,
+} from "../types";
 
 /** 安全模式：设置/解锁主密码 */
 export async function setupMasterPassword(password: string): Promise<boolean> {
@@ -25,8 +33,8 @@ export async function changeMasterPassword(
 /** 笔记 */
 export const notesApi = {
   list: () => invoke<Note[]>("list_notes"),
-  create: (title: string, groupId?: string) =>
-    invoke<Note>("create_note", { title, groupId }),
+  create: (title: string, mode: string, groupId?: string) =>
+    invoke<Note>("create_note", { title, groupId, mode }),
   update: (note: Note) => invoke<Note>("update_note", { note }),
   delete: (id: string) => invoke<void>("delete_note", { id }),
   togglePinned: (id: string) => invoke<Note>("toggle_pin_note", { id }),
@@ -83,4 +91,10 @@ export const syncApi = {
 export const storageApi = {
   getDir: () => invoke<string>("get_data_dir"),
   setDir: (newDir: string) => invoke<string>("set_data_dir", { newDir }),
+};
+
+/** 应用偏好（主题） */
+export const themeApi = {
+  get: () => invoke<ThemeMode>("get_theme"),
+  set: (mode: ThemeMode) => invoke<void>("set_theme", { mode }),
 };

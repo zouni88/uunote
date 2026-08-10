@@ -1,12 +1,16 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { groupsApi, notesApi } from "../api";
-import type { Note, NoteGroup } from "../types";
+import type { Note, NoteEditMode, NoteGroup } from "../types";
 import ErrorBoundary from "../components/ErrorBoundary";
+import NewNoteDialog from "../components/NewNoteDialog";
 import { toast, toastUndo } from "../components/Toaster";
 import { consumePendingNavigate } from "../lib/events";
+import { EDIT_MODES, EditModeIcon } from "../lib/editModes";
 
-// 自由画布编辑器按需加载，避免拖慢启动
+// 三种编辑器按需加载，避免拖慢启动
 const FreeformEditor = lazy(() => import("../components/FreeformEditor"));
+const MarkdownEditor = lazy(() => import("../components/MarkdownEditor"));
+const RichTextEditor = lazy(() => import("../components/RichTextEditor"));
 
 /** "未分组"区段的折叠键（分组 id 用不到该值，避免冲突） */
 const UNGROUPED_KEY = "__ungrouped__";
@@ -46,9 +50,14 @@ export default function NotesPage() {
     x: number;
     y: number;
   } | null>(null);
-  const blocksSaveTimer = useRef<number>(0);
-  // 画布最新场景 JSON（画布改动可能尚未经 refresh 回流到 selected，保存时必须用最新值）
-  const latestBlocksJson = useRef("");
+  // 新建笔记对话框（groupId = 新笔记所属分组，null = 未分组）
+  const [newNoteDlg, setNewNoteDlg] = useState<{
+    open: boolean;
+    groupId: string | null;
+  }>({ open: false, groupId: null });
+  const saveTimer = useRef<number>(0);
+  // 当前笔记内容的最新值（编辑器改动可能尚未经 refresh 回流到 selected，保存时必须用最新值）
+  const latestContent = useRef("");
 
   async function refresh() {
     const [noteList, groupList] = await Promise.all([
@@ -65,7 +74,7 @@ export default function NotesPage() {
       if (note) {
         setSelectedId(note.id);
         setTitle(note.title);
-        latestBlocksJson.current = note.blocks;
+        latestContent.current = note.content;
         setEditing(true);
         const gid = note.groupId ?? null;
         setSelectedGroupId(gid);
@@ -76,7 +85,7 @@ export default function NotesPage() {
 
   useEffect(() => {
     refresh();
-    return () => clearTimeout(blocksSaveTimer.current);
+    return () => clearTimeout(saveTimer.current);
   }, []);
 
   // 点击空白处 / Esc 关闭分组右键菜单
@@ -113,9 +122,11 @@ export default function NotesPage() {
       const el = document.activeElement as HTMLElement | null;
       const tag = el?.tagName?.toLowerCase() ?? "";
       const typing = tag === "input" || tag === "textarea" || el?.isContentEditable;
+      // 新建对话框打开时禁用全局新建/保存快捷键，避免干扰输入
+      if (newNoteDlg.open) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n") {
         e.preventDefault();
-        handleNew();
+        openNewNoteDialog(null);
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
         handleSave();
@@ -134,11 +145,11 @@ export default function NotesPage() {
     const finalTitle = title.trim() || "无标题";
     try {
       if (selected) {
-        // 画布笔记必须用 ref 里的最新场景，避免用列表里的旧值覆盖画布内容
+        // 必须用 ref 里的最新内容，避免用列表里的旧值覆盖编辑器内容
         const updated = await notesApi.update({
           ...selected,
           title: finalTitle,
-          blocks: latestBlocksJson.current,
+          content: latestContent.current,
         });
         setSelectedId(updated.id);
         // 保存后保持编辑状态，不关闭笔记
@@ -148,11 +159,12 @@ export default function NotesPage() {
         // 新笔记落入当前选中的分组（未选中则为"未分组"）
         const created = await notesApi.create(
           finalTitle,
+          "freeform",
           selectedGroupId ?? undefined
         );
-        // 新笔记首次保存：把编辑器中已画的画布内容一并落库
-        if (latestBlocksJson.current) {
-          await notesApi.update({ ...created, blocks: latestBlocksJson.current });
+        // 新笔记首次保存：把编辑器中已画的内容一并落库
+        if (latestContent.current) {
+          await notesApi.update({ ...created, content: latestContent.current });
         }
         setSelectedId(created.id);
         setEditing(true);
@@ -165,20 +177,38 @@ export default function NotesPage() {
     }
   }
 
-  async function handleNew() {
-    await flushBlocksSave();
-    setSelectedId(null);
-    setTitle("");
-    latestBlocksJson.current = "";
-    setEditing(true);
+  /** 打开新建笔记对话框（groupId = 目标分组，null = 未分组） */
+  function openNewNoteDialog(groupId: string | null) {
+    setNewNoteDlg({ open: true, groupId });
+  }
+
+  /** 以指定模式创建笔记并立即进入对应编辑器（模式创建后锁定） */
+  async function createNoteWithMode(title: string, mode: NoteEditMode) {
+    const groupId = newNoteDlg.groupId;
+    await flushSave();
+    try {
+      const created = await notesApi.create(title || "无标题", mode, groupId ?? undefined);
+      setSelectedGroupId(groupId);
+      setCollapsed((c) => ({ ...c, [groupId ?? UNGROUPED_KEY]: false }));
+      setSelectedId(created.id);
+      setTitle(created.title);
+      latestContent.current = "";
+      setEditing(true);
+      setNewNoteDlg({ open: false, groupId: null });
+      setSaveStatus("");
+      await refresh();
+    } catch (e) {
+      console.error("新建笔记失败", e);
+      toast("新建笔记失败，请重试", { kind: "error" });
+    }
   }
 
   async function handleSelect(note: Note) {
-    // 切换前先落盘当前笔记的画布内容
-    await flushBlocksSave();
+    // 切换前先落盘当前笔记待保存的内容
+    await flushSave();
     setSelectedId(note.id);
     setTitle(note.title);
-    latestBlocksJson.current = note.blocks;
+    latestContent.current = note.content;
     setEditing(true);
     // 打开笔记时定位到其所在分组并展开
     const gid = note.groupId ?? null;
@@ -190,15 +220,15 @@ export default function NotesPage() {
   async function deleteNote(note: Note) {
     // 若删除的是当前编辑中的笔记，清除其待保存定时器
     if (note.id === selectedId) {
-      if (blocksSaveTimer.current) clearTimeout(blocksSaveTimer.current);
-      blocksSaveTimer.current = 0;
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+      saveTimer.current = 0;
       setSelectedId(null);
       setTitle("");
       setEditing(false);
     }
     const snapshot: Note = {
       ...note,
-      blocks: note.id === selectedId ? latestBlocksJson.current : note.blocks,
+      content: note.id === selectedId ? latestContent.current : note.content,
     };
     try {
       await notesApi.delete(note.id);
@@ -210,16 +240,17 @@ export default function NotesPage() {
     }
   }
 
-  /** 撤销删除：重建笔记（标题 + 画布 + 置顶 + 分组） */
+  /** 撤销删除：重建笔记（标题 + 内容 + 模式 + 置顶 + 分组） */
   async function restoreNote(snapshot: Note) {
     try {
       const groupExists = groups.some((g) => g.id === snapshot.groupId);
       const created = await notesApi.create(
         snapshot.title || "无标题",
+        snapshot.mode,
         groupExists ? (snapshot.groupId ?? undefined) : undefined
       );
       const patch: Partial<Note> = {};
-      if (snapshot.blocks) patch.blocks = snapshot.blocks;
+      if (snapshot.content) patch.content = snapshot.content;
       if (snapshot.pinned) patch.pinned = true;
       await notesApi.update({ ...created, ...patch });
       await refresh();
@@ -250,23 +281,21 @@ export default function NotesPage() {
     const note = notes.find((n) => n.id === noteId);
     if (!note) return;
     if ((note.groupId ?? null) === groupId) return;
-    // 拖拽的是当前编辑笔记时，用画布最新内容，避免丢失未保存的改动
-    const blocks = note.id === selectedId ? latestBlocksJson.current : note.blocks;
-    await notesApi.update({ ...note, groupId, blocks });
+    // 拖拽的是当前编辑笔记时，用编辑器最新内容，避免丢失未保存的改动
+    const isCurrent = note.id === selectedId;
+    const patch: Partial<Note> = {};
+    if (isCurrent) {
+      patch.content = latestContent.current;
+    }
+    await notesApi.update({ ...note, groupId, ...patch });
     setSelectedGroupId(groupId);
     setCollapsed((c) => ({ ...c, [groupId ?? UNGROUPED_KEY]: false }));
     await refresh();
   }
 
-  /** 在指定分组内新建笔记 */
-  async function createNoteInGroup(groupId: string) {
-    await flushBlocksSave();
-    setSelectedGroupId(groupId);
-    setCollapsed((c) => ({ ...c, [groupId]: false }));
-    setSelectedId(null);
-    setTitle("");
-    latestBlocksJson.current = "";
-    setEditing(true);
+  /** 在指定分组内新建笔记：弹出模式选择对话框 */
+  function createNoteInGroup(groupId: string) {
+    openNewNoteDialog(groupId);
   }
 
   /** 打开内联"新建分组"输入 */
@@ -360,14 +389,9 @@ export default function NotesPage() {
     setCtxMenu({ kind: "list", x, y });
   }
 
-  /** 在指定分组（null = 未分组）新建笔记 */
+  /** 在指定分组（null = 未分组）新建笔记：弹出模式选择对话框 */
   function startNewIn(groupId: string | null) {
-    if (groupId === null) {
-      setSelectedGroupId(null);
-      handleNew();
-    } else {
-      createNoteInGroup(groupId);
-    }
+    openNewNoteDialog(groupId);
   }
 
   const ctxGroup =
@@ -375,40 +399,39 @@ export default function NotesPage() {
       ? groups.find((g) => g.id === ctxMenu.groupId) ?? null
       : null;
 
-  /** 立即落盘当前笔记待保存的画布内容（切换笔记前调用，防止丢失） */
-  async function flushBlocksSave() {
+  /** 立即落盘当前笔记待保存的内容（切换笔记/新建前调用，防止丢失） */
+  async function flushSave() {
     if (!selected || !selectedId) return;
-    if (blocksSaveTimer.current) {
-      clearTimeout(blocksSaveTimer.current);
-      blocksSaveTimer.current = 0;
-      try {
-        await notesApi.update({
-          ...selected,
-          blocks: latestBlocksJson.current,
-        });
-      } catch (e) {
-        console.error("画布保存失败", e);
-      }
+    if (!saveTimer.current) return;
+    clearTimeout(saveTimer.current);
+    saveTimer.current = 0;
+    try {
+      await notesApi.update({
+        ...selected,
+        content: latestContent.current,
+      });
+    } catch (e) {
+      console.error("笔记保存失败", e);
     }
   }
 
-  /** 画布内容防抖自动保存 */
-  function handleSceneChange(json: string) {
+  /** 内容防抖自动保存（编辑器变更统一走这里，按模式写入对应内容） */
+  function handleContentChange(content: string) {
     if (!selected) return;
-    latestBlocksJson.current = json;
-    clearTimeout(blocksSaveTimer.current);
-    blocksSaveTimer.current = window.setTimeout(async () => {
+    latestContent.current = content;
+    clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(async () => {
       const current = notes.find((n) => n.id === selectedId);
       if (!current) return;
       try {
         await notesApi.update({
           ...current,
-          blocks: latestBlocksJson.current,
+          content: latestContent.current,
         });
         setSaveStatus("已保存 " + new Date().toLocaleTimeString());
         refresh();
       } catch (e) {
-        console.error("画布自动保存失败", e);
+        console.error("自动保存失败", e);
         setSaveStatus("保存失败");
       }
     }, 800);
@@ -567,7 +590,7 @@ export default function NotesPage() {
             <button className="header-btn" onClick={openNewGroup} title="新建分组">
               ＋分组
             </button>
-            <button className="header-btn primary" onClick={handleNew} title="新建笔记">
+            <button className="header-btn primary" onClick={() => openNewNoteDialog(null)} title="新建笔记">
               ＋笔记
             </button>
           </div>
@@ -582,8 +605,8 @@ export default function NotesPage() {
                 </svg>
               </div>
               <p className="empty-state-title">开始你的第一篇笔记</p>
-              <p className="empty-state-hint">支持自由画布：文字、图片、表格、涂鸦随意摆放</p>
-              <button className="primary" onClick={handleNew}>
+              <p className="empty-state-hint">支持自由画布、Markdown、富文本三种编辑模式</p>
+              <button className="primary" onClick={() => openNewNoteDialog(null)}>
                 新建笔记
               </button>
             </div>
@@ -593,10 +616,7 @@ export default function NotesPage() {
             renderGroupNode(UNGROUPED_KEY, "未分组", ungroupedNotes, {
               isUngrouped: true,
               onTitleClick: () => setSelectedGroupId(null),
-              onPlus: () => {
-                setSelectedGroupId(null);
-                handleNew();
-              },
+              onPlus: () => openNewNoteDialog(null),
             })}
 
           {groups.map((group) => {
@@ -727,19 +747,25 @@ export default function NotesPage() {
               />
               <div className="toolbar-actions">
                 {selected && (
-                  <select
-                    className="group-select"
-                    value={selected.groupId ?? ""}
-                    onChange={(e) => moveNote(e.target.value)}
-                    title="移动笔记到分组"
-                  >
-                    <option value="">未分组</option>
-                    {groups.map((g) => (
-                      <option key={g.id} value={g.id}>
-                        {g.title}
-                      </option>
-                    ))}
-                  </select>
+                  <>
+                    <div className="mode-badge" title="创建时选定的模式，不可切换">
+                      <EditModeIcon mode={selected.mode} size={14} />
+                      {EDIT_MODES.find((m) => m.key === selected.mode)?.label}
+                    </div>
+                    <select
+                      className="group-select"
+                      value={selected.groupId ?? ""}
+                      onChange={(e) => moveNote(e.target.value)}
+                      title="移动笔记到分组"
+                    >
+                      <option value="">未分组</option>
+                      {groups.map((g) => (
+                        <option key={g.id} value={g.id}>
+                          {g.title}
+                        </option>
+                      ))}
+                    </select>
+                  </>
                 )}
                 <span className="save-status">{saveStatus}</span>
                 {selected && (
@@ -762,14 +788,28 @@ export default function NotesPage() {
             </div>
             <ErrorBoundary>
               <Suspense
-                fallback={<div className="canvas-loading">画布加载中…</div>}
+                fallback={<div className="canvas-loading">编辑器加载中…</div>}
               >
-                <FreeformEditor
-                  key={selected?.id ?? "new-canvas"}
-                  sceneJson={selected?.blocks ?? ""}
-                  onSceneChange={handleSceneChange}
-                  latestJsonRef={latestBlocksJson}
-                />
+                {selected && selected.mode === "markdown" ? (
+                  <MarkdownEditor
+                    key={`${selected.id}-md`}
+                    value={selected.content}
+                    onChange={handleContentChange}
+                  />
+                ) : selected && selected.mode === "richtext" ? (
+                  <RichTextEditor
+                    key={`${selected.id}-rt`}
+                    value={selected.content}
+                    onChange={handleContentChange}
+                  />
+                ) : (
+                  <FreeformEditor
+                    key={selected?.id ?? "new-canvas"}
+                    sceneJson={selected?.content ?? ""}
+                    onSceneChange={handleContentChange}
+                    latestJsonRef={latestContent}
+                  />
+                )}
               </Suspense>
             </ErrorBoundary>
           </>
@@ -778,6 +818,9 @@ export default function NotesPage() {
             <div>
               <p className="placeholder-title">选择或新建一篇笔记</p>
               <p className="placeholder-hint">Ctrl + N 快速新建 · Ctrl + K 全局搜索</p>
+              <button className="primary" onClick={() => openNewNoteDialog(null)}>
+                新建笔记
+              </button>
             </div>
           </div>
         )}
@@ -837,7 +880,7 @@ export default function NotesPage() {
               <button
                 className="group-menu-item"
                 onClick={() => {
-                  handleNew();
+                  openNewNoteDialog(null);
                   setCtxMenu(null);
                 }}
               >
@@ -846,6 +889,14 @@ export default function NotesPage() {
             </>
           )}
         </div>
+      )}
+
+      {newNoteDlg.open && (
+        <NewNoteDialog
+          groupId={newNoteDlg.groupId}
+          onCancel={() => setNewNoteDlg({ open: false, groupId: null })}
+          onCreate={createNoteWithMode}
+        />
       )}
     </div>
   );

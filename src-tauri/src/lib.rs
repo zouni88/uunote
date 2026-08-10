@@ -3,6 +3,7 @@ mod commands;
 mod crypto;
 mod db;
 mod error;
+mod settings;
 mod state;
 mod sync;
 
@@ -17,6 +18,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            // 设置窗口图标（Windows 任务栏、Alt+Tab 等）
+            if let (Some(window), Some(icon)) =
+                (app.get_webview_window("main"), app.default_window_icon())
+            {
+                let _ = window.set_icon(icon.clone());
+            }
             // 应用数据目录：数据库、vault、同步仓库均存于此。
             // 用户可在设置中更改存储位置，此处读取指针文件解析最终目录。
             let data_dir = state::resolve_data_dir(&app.path().app_data_dir()?)?;
@@ -60,6 +67,8 @@ pub fn run() {
             commands::sync::sync_auto,
             commands::storage::get_data_dir,
             commands::storage::set_data_dir,
+            commands::settings::get_theme,
+            commands::settings::set_theme,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

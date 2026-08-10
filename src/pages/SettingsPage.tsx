@@ -1,8 +1,43 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { changeMasterPassword, storageApi, syncApi } from "../api";
-import type { SyncConfig, SyncStatus } from "../types";
+import { changeMasterPassword, storageApi, syncApi, themeApi } from "../api";
+import { setTheme } from "../lib/theme";
+import type { SyncConfig, SyncStatus, ThemeMode } from "../types";
+
+/** 主题选项（图标用内联 SVG，避免引入图标库） */
+const THEME_OPTIONS: { value: ThemeMode; label: string; icon: ReactNode }[] = [
+  {
+    value: "light",
+    label: "浅色",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+        <circle cx="12" cy="12" r="4" />
+        <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+      </svg>
+    ),
+  },
+  {
+    value: "dark",
+    label: "深色",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+      </svg>
+    ),
+  },
+  {
+    value: "system",
+    label: "跟随系统",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="2" y="3" width="20" height="14" rx="2" />
+        <path d="M8 21h8M12 17v4" />
+      </svg>
+    ),
+  },
+];
 
 export default function SettingsPage() {
   const [config, setConfig] = useState<SyncConfig | null>(null);
@@ -22,6 +57,11 @@ export default function SettingsPage() {
   const [dataDir, setDataDir] = useState("");
   const [moving, setMoving] = useState(false);
   const [storageMsg, setStorageMsg] = useState("");
+  const [theme, setThemeMode] = useState<ThemeMode>("system");
+
+  useEffect(() => {
+    themeApi.get().then(setThemeMode).catch(() => {});
+  }, []);
 
   useEffect(() => {
     syncApi.config().then((cfg) => {
@@ -58,6 +98,17 @@ export default function SettingsPage() {
       setStorageMsg(`迁移失败：${e}`);
     } finally {
       setMoving(false);
+    }
+  }
+
+  /** 切换主题：立即应用并持久化到后端 */
+  async function selectTheme(mode: ThemeMode) {
+    setThemeMode(mode);
+    try {
+      await setTheme(mode);
+    } catch (e) {
+      setThemeMode(await themeApi.get().catch(() => "system" as ThemeMode));
+      setStorageMsg(`主题切换失败：${e}`);
     }
   }
 
@@ -134,6 +185,27 @@ export default function SettingsPage() {
   return (
     <div className="page settings-page">
       <h2>设置</h2>
+
+      <section className="settings-section">
+        <h3>主题</h3>
+        <p className="settings-hint">
+          选择应用配色方案；「跟随系统」会自动匹配操作系统的浅色 / 深色设置。
+        </p>
+        <div className="theme-options" role="radiogroup" aria-label="主题">
+          {THEME_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              className={`theme-option ${theme === opt.value ? "active" : ""}`}
+              role="radio"
+              aria-checked={theme === opt.value}
+              onClick={() => selectTheme(opt.value)}
+            >
+              <span className="theme-option-icon">{opt.icon}</span>
+              <span>{opt.label}</span>
+            </button>
+          ))}
+        </div>
+      </section>
 
       <section className="settings-section">
         <h3>云同步</h3>

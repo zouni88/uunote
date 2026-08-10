@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { setupMasterPassword, unlockApp } from "../api";
+import WindowControls from "./WindowControls";
 
 interface LockScreenProps {
   onUnlocked: () => void;
@@ -41,7 +42,10 @@ export default function LockScreen({ onUnlocked }: LockScreenProps) {
   }
 
   return (
-    <div className="lock-screen">
+    <div className="lock-screen" data-tauri-drag-region="deep">
+      <div className="lock-winctrl">
+        <WindowControls />
+      </div>
       <div className="lock-card">
         <div className="lock-brand">
           <span className="brand-logo">U</span> UUNote

@@ -1,6 +1,6 @@
 [package]
 name = "uunote"
-version = "1.0.0"
+version = "1.0.2"
 description = "个人笔记、账号与重要资料管理桌面软件"
 authors = ["zouni"]
 edition = "2021"

@@ -101,7 +101,7 @@ pub fn delete(conn: &Connection, id: &str) -> AppResult<()> {
     // 组内笔记回落到"未分组"：一并生成 note 操作，保证其他设备正确合并
     let affected: Vec<crate::db::notes::Note> = {
         let mut stmt = tx.prepare(
-            "SELECT id, title, blocks, pinned, group_id, created_at, updated_at
+            "SELECT id, title, mode, content, pinned, group_id, created_at, updated_at
              FROM notes WHERE group_id = ?1",
         )?;
         let rows = stmt
@@ -109,11 +109,12 @@ pub fn delete(conn: &Connection, id: &str) -> AppResult<()> {
                 Ok(crate::db::notes::Note {
                     id: r.get(0)?,
                     title: r.get(1)?,
-                    blocks: r.get(2)?,
-                    pinned: r.get::<_, i64>(3)? != 0,
-                    group_id: r.get(4)?,
-                    created_at: r.get(5)?,
-                    updated_at: r.get(6)?,
+                    mode: r.get(2)?,
+                    content: r.get(3)?,
+                    pinned: r.get::<_, i64>(4)? != 0,
+                    group_id: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

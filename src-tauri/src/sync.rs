@@ -418,13 +418,14 @@ fn apply_op(
             } else {
                 let note: notes::Note = serde_json::from_str(&op.data)?;
                 conn.execute(
-                    "INSERT INTO notes (id, title, blocks, pinned, group_id, created_at, updated_at, v_lamport, v_device)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(id) DO UPDATE SET title = excluded.title, blocks = excluded.blocks,
-                        pinned = excluded.pinned, group_id = excluded.group_id,
+                    "INSERT INTO notes (id, title, mode, content, pinned, group_id, created_at, updated_at, v_lamport, v_device)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     ON CONFLICT(id) DO UPDATE SET title = excluded.title, mode = excluded.mode,
+                        content = excluded.content, pinned = excluded.pinned, group_id = excluded.group_id,
                         updated_at = excluded.updated_at,
                         v_lamport = excluded.v_lamport, v_device = excluded.v_device",
-                    (&note.id, &note.title, &note.blocks, note.pinned as i64, &note.group_id,
+                    (&note.id, &note.title, &note.mode, &note.content,
+                     note.pinned as i64, &note.group_id,
                      &note.created_at, &note.updated_at, op.lamport, op_device),
                 )?;
                 outbox::remove_tombstone(conn, "note", &op.record_id)?;
@@ -723,11 +724,11 @@ fn import_snapshot(state: &AppState, key: &[u8; crypto::KEY_LEN]) -> AppResult<(
     }
     for n in &notes_list {
         tx.execute(
-            "INSERT INTO notes (id, title, blocks, pinned, group_id, created_at, updated_at, v_lamport, v_device)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO notes (id, title, mode, content, pinned, group_id, created_at, updated_at, v_lamport, v_device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             (
-                &n.id, &n.title, &n.blocks, n.pinned as i64, &n.group_id,
-                &n.created_at, &n.updated_at, baseline, "",
+                &n.id, &n.title, &n.mode, &n.content, n.pinned as i64,
+                &n.group_id, &n.created_at, &n.updated_at, baseline, "",
             ),
         )?;
     }
@@ -802,10 +803,11 @@ fn import_snapshot_legacy(
     outbox::clear_tombstones(&tx)?;
     for n in &snapshot.notes {
         tx.execute(
-            "INSERT INTO notes (id, title, blocks, pinned, created_at, updated_at, v_lamport, v_device)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, '')",
+            "INSERT INTO notes (id, title, mode, content, pinned, created_at, updated_at, v_lamport, v_device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, '')",
             (
-                &n.id, &n.title, &n.blocks, n.pinned as i64, &n.created_at, &n.updated_at,
+                &n.id, &n.title, &n.mode, &n.content,
+                n.pinned as i64, &n.created_at, &n.updated_at,
             ),
         )?;
     }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import Sidebar from "./components/Sidebar";
+import Titlebar from "./components/Titlebar";
 import LockScreen from "./components/LockScreen";
 import Toaster from "./components/Toaster";
 import CommandPalette from "./components/CommandPalette";
@@ -10,6 +10,7 @@ import SettingsPage from "./pages/SettingsPage";
 import AboutPage from "./pages/AboutPage";
 import { isAppLocked } from "./api";
 import { on } from "./lib/events";
+import { watchSystemTheme } from "./lib/theme";
 import type { NavigateTarget } from "./lib/events";
 import type { PageKey } from "./types";
 import "./App.css";
@@ -22,6 +23,9 @@ export default function App() {
   useEffect(() => {
     isAppLocked().then(setLocked);
   }, []);
+
+  // 跟随系统时监听系统配色变化（由 lib/theme 统一处理并应用）
+  useEffect(() => watchSystemTheme(), []);
 
   // 命令面板跳转请求（Cmd+K 搜索结果）
   useEffect(() => {
@@ -49,7 +53,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar current={page} onChange={setPage} />
+      <Titlebar page={page} onOpenPalette={() => setPaletteOpen(true)} />
       <main className="app-main">
         {page === "notes" && <NotesPage />}
         {page === "accounts" && <AccountsPage />}

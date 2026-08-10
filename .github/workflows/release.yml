@@ -57,7 +57,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: "UUNote v__VERSION__"
           releaseBody: |
-            UUNote 1.0.0 —— 本地加密的笔记 / 账号 / 重要资料管理工具。
+            UUNote 1.0.2 —— 本地加密的笔记 / 账号 / 重要资料管理工具。
 
             ## 下载安装
             - Windows：`*-setup.exe` 安装包
@@ -65,6 +65,10 @@ jobs:
             - macOS：`*.dmg`
 
             ## 变更
-            - 首个正式版本
+            - 笔记新增 Markdown、富文本两种编辑模式（创建时选择，创建后锁定）
+            - 自定义无边框标题栏与窗口控制按钮
+            - 新增深色 / 浅色主题设置
+            - 更新应用图标（Windows 任务栏、Alt+Tab 等）
+            - 数据库升级迁移优化，兼容旧版本数据平滑升级
           releaseDraft: false
           prerelease: false

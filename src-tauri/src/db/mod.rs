@@ -32,7 +32,8 @@ fn init_schema(conn: &Connection) -> AppResult<()> {
         CREATE TABLE IF NOT EXISTS notes (
             id         TEXT PRIMARY KEY,
             title      TEXT NOT NULL,
-            blocks     TEXT NOT NULL DEFAULT '',
+            mode       TEXT NOT NULL DEFAULT 'freeform',
+            content    TEXT NOT NULL DEFAULT '',
             pinned     INTEGER NOT NULL DEFAULT 0,
             group_id   TEXT,
             created_at TEXT NOT NULL,
@@ -107,8 +108,9 @@ fn init_schema(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-/// 老库升级：旧版笔记为"文字/画布"双模式结构（content/canvas_elements/note_type），
-/// 已废弃作废。整体重建为单一自由画布结构（blocks），旧内容不迁移。
+/// 老库升级：旧版笔记为多内容列结构，统一收敛为「mode + content」单列结构：
+///   - 三列版（blocks/markdown/rich_text）：按 mode 取对应列内容，其余列合并进 content
+///   - 更早的双列版（content/canvas_elements/note_type）：内容已废弃，仅保留标题等元数据（与历史行为一致）
 fn migrate(conn: &Connection) -> AppResult<()> {
     let has_col = |table: &str, name: &str| -> bool {
         let cols: Vec<String> = conn
@@ -120,13 +122,15 @@ fn migrate(conn: &Connection) -> AppResult<()> {
             .unwrap_or_default();
         cols.iter().any(|c| c == name)
     };
-    if has_col("notes", "content") || has_col("notes", "canvas_elements") || has_col("notes", "note_type") {
+    if has_col("notes", "blocks") || has_col("notes", "markdown") || has_col("notes", "rich_text") {
+        // 三列版 → 单一 content：按 mode 归并内容
         conn.execute_batch(
-            "ALTER TABLE notes RENAME TO notes_legacy;
+            "ALTER TABLE notes RENAME TO notes_old;
              CREATE TABLE notes (
                 id         TEXT PRIMARY KEY,
                 title      TEXT NOT NULL,
-                blocks     TEXT NOT NULL DEFAULT '',
+                mode       TEXT NOT NULL DEFAULT 'freeform',
+                content    TEXT NOT NULL DEFAULT '',
                 pinned     INTEGER NOT NULL DEFAULT 0,
                 group_id   TEXT,
                 created_at TEXT NOT NULL,
@@ -134,16 +138,45 @@ fn migrate(conn: &Connection) -> AppResult<()> {
                 v_lamport  INTEGER NOT NULL DEFAULT 0,
                 v_device   TEXT NOT NULL DEFAULT ''
              );
-             INSERT INTO notes (id, title, blocks, pinned, created_at, updated_at)
-                SELECT id, title, '', pinned, created_at, updated_at FROM notes_legacy;
-             DROP TABLE notes_legacy;",
+             INSERT INTO notes (id, title, mode, content, pinned, group_id, created_at, updated_at, v_lamport, v_device)
+                SELECT id, title, mode,
+                       CASE WHEN mode = 'markdown' THEN markdown
+                            WHEN mode = 'richtext' THEN rich_text
+                            ELSE blocks END,
+                       pinned, group_id, created_at, updated_at, v_lamport, v_device
+                FROM notes_old;
+             DROP TABLE notes_old;",
+        )?;
+    } else if has_col("notes", "canvas_elements")
+        || has_col("notes", "note_type")
+        || (has_col("notes", "content") && !has_col("notes", "mode"))
+    {
+        // 更早的双列版（有 content/canvas_elements，无 mode）：内容废弃不迁移，仅保留标题等元数据。
+        // 注意：新库同样含 content 列，必须用「无 mode 列」区分，否则每次启动都会误判重建清空数据。
+        conn.execute_batch(
+            "ALTER TABLE notes RENAME TO notes_old;
+             CREATE TABLE notes (
+                id         TEXT PRIMARY KEY,
+                title      TEXT NOT NULL,
+                mode       TEXT NOT NULL DEFAULT 'freeform',
+                content    TEXT NOT NULL DEFAULT '',
+                pinned     INTEGER NOT NULL DEFAULT 0,
+                group_id   TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                v_lamport  INTEGER NOT NULL DEFAULT 0,
+                v_device   TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO notes (id, title, pinned, created_at, updated_at)
+                SELECT id, title, pinned, created_at, updated_at FROM notes_old;
+             DROP TABLE notes_old;",
         )?;
     }
-    // 二级分组结构：为已有库补充 notes.group_id 列（新库建表时已包含）
+    // 二级分组结构：为老库补充 notes.group_id 列（新库建表时已包含）
     if !has_col("notes", "group_id") {
         conn.execute_batch("ALTER TABLE notes ADD COLUMN group_id TEXT")?;
     }
-    // 增量同步版本列：为已有库补充 v_lamport / v_device（新库建表时已包含）
+    // 增量同步版本列：为老库补充 v_lamport / v_device（新库建表时已包含）
     for (table, cols) in [
         ("notes", ["v_lamport", "v_device"]),
         ("note_groups", ["v_lamport", "v_device"]),

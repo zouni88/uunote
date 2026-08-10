@@ -19,7 +19,8 @@ const MAX_ZOOM = 3;
 const DEFAULT_TEXT_WIDTH = 120;
 const DEFAULT_COL_WIDTH = 120;
 const DEFAULT_FONT_SIZE = 16;
-const DEFAULT_COLOR = "#1f2937";
+/** 未显式指定颜色时的文字默认色（跟随主题，深色画布下自动变浅） */
+const DEFAULT_COLOR = "var(--text)";
 
 /** 右键菜单可选的文字字号 / 颜色 */
 const FONT_SIZES = [12, 14, 16, 18, 20, 24, 32];
@@ -28,8 +29,8 @@ const TEXT_COLORS = [
   "#ca8a04", "#16a34a", "#2563eb", "#7c3aed",
 ];
 
-/** 画笔可选的墨色 / 粗细（OneNote 式手写选项） */
-const DRAW_COLORS = ["#1e293b", "#dc2626", "#2563eb", "#16a34a", "#ca8a04", "#9333ea"];
+/** 画笔可选的墨色 / 粗细（OneNote 式手写选项；末位浅灰墨供深色画布使用） */
+const DRAW_COLORS = ["#1e293b", "#dc2626", "#2563eb", "#16a34a", "#ca8a04", "#9333ea", "#cbd3e1"];
 const DRAW_WIDTHS = [1.5, 2.5, 4, 6];
 
 /** 标题级别对应的字号（px） */
@@ -62,7 +63,7 @@ function parseScene(sceneJson: string): FreeformScene {
   try {
     const data = JSON.parse(sceneJson);
     if (data && typeof data === "object" && Array.isArray(data.blocks)) {
-      return data;
+      return { version: 1, blocks: normalizeBlocks(data.blocks) };
     }
   } catch {
     console.error("画布场景 JSON 解析失败", sceneJson.slice(0, 200));
@@ -70,9 +71,47 @@ function parseScene(sceneJson: string): FreeformScene {
   return { version: 1, blocks: [] };
 }
 
+/**
+ * 归一化块数据：只修复旧数据里不完整的表格结构（cells/colWidths），
+ * 其他块原样透传，避免改动坐标/尺寸改变既有布局与交互行为。
+ */
+function normalizeBlocks(raw: FreeformBlock[]): FreeformBlock[] {
+  return raw.map((b) => {
+    if (b.type === "table" && b.table) {
+      const cols = b.table.cols && b.table.cols > 0
+        ? b.table.cols
+        : Math.max(1, b.table.colWidths?.length || 1);
+      const rows = b.table.rows && b.table.rows > 0
+        ? b.table.rows
+        : Math.max(1, b.table.cells?.length || 1);
+      const colWidths =
+        Array.isArray(b.table.colWidths) && b.table.colWidths.length === cols
+          ? b.table.colWidths
+          : Array.from({ length: cols }, () => DEFAULT_COL_WIDTH);
+      // 重建成 rows×cols 网格，防止旧数据行数不足 / 某行不是数组导致渲染崩溃
+      const rawCells = Array.isArray(b.table.cells) ? b.table.cells : [];
+      const cells = Array.from({ length: rows }, (_, ri) =>
+        Array.from({ length: cols }, (_, ci) => {
+          const row = rawCells[ri];
+          return Array.isArray(row) ? row[ci] ?? "" : "";
+        }),
+      );
+      return { ...b, table: { ...b.table, cols, rows, colWidths, cells } };
+    }
+    return b;
+  });
+}
+
 function ptsToPath(pts: [number, number][]): string {
+  if (!Array.isArray(pts)) return "";
   return pts
-    .map((p, i) => `${i ? "L" : "M"} ${p[0].toFixed(1)} ${p[1].toFixed(1)}`)
+    .map((p, i) => {
+      const x = Number(p?.[0]);
+      const y = Number(p?.[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      return `${i ? "L" : "M"} ${x.toFixed(1)} ${y.toFixed(1)}`;
+    })
+    .filter((s): s is string => s !== null)
     .join(" ");
 }
 
@@ -82,9 +121,13 @@ function makeTable(rows: number, cols: number, colWidths: number[] = []): Freefo
   return { rows, cols, cells, colWidths: widths };
 }
 
-/** 表格总宽（各列宽之和） */
+/** 表格总宽（各列宽之和，数据缺失时按默认列宽估算） */
 function tableTotalWidth(t?: FreeformTable): number {
-  return t ? t.colWidths.reduce((a, b) => a + b, 0) : 0;
+  if (!t) return 0;
+  if (!Array.isArray(t.colWidths) || t.colWidths.length === 0) {
+    return (t.cols || 1) * DEFAULT_COL_WIDTH;
+  }
+  return t.colWidths.reduce((a, b) => a + (Number(b) || DEFAULT_COL_WIDTH), 0);
 }
 
 const clamp = (v: number, min: number, max: number) => Math.min(Math.max(v, min), max);
@@ -126,8 +169,12 @@ export default function FreeformEditor({
     color: string;
     width: number;
   } | null>(null);
-  /** 画笔当前墨色 / 粗细 */
-  const [drawColor, setDrawColor] = useState(DRAW_COLORS[0]);
+  /** 画笔当前墨色 / 粗细（默认墨色跟随主题：深色画布下用浅色墨，否则看不见） */
+  const [drawColor, setDrawColor] = useState(
+    () =>
+      getComputedStyle(document.documentElement).getPropertyValue("--ink-dot").trim() ||
+      DRAW_COLORS[0],
+  );
   const [drawWidth, setDrawWidth] = useState(DRAW_WIDTHS[1]);
   /** 撤销/重做快照栈（存"操作前"的 blocks），连续高频操作自动合并为一步 */
   const undoStackRef = useRef<FreeformBlock[][]>([]);
@@ -316,24 +363,7 @@ export default function FreeformEditor({
           if (b.id !== r.id) return b;
           // 放大时不允许把块拉出画布右边界
           const maxW = Math.max(80, PAGE_W - b.x);
-          if (b.type === "text") {
-            return { ...b, width: Math.max(80, Math.min(maxW, Math.round(r.origW + dx))) };
-          }
           const nw = Math.max(80, Math.min(maxW, Math.round(r.origW + dx)));
-          if (b.type === "table" && b.table) {
-            // 表格整体缩放：按比例调整各列宽，行高跟随内容自适应
-            const scale = nw / r.origW;
-            return {
-              ...b,
-              width: nw,
-              table: {
-                ...b.table,
-                colWidths: b.table.colWidths.map((cw) =>
-                  Math.max(40, Math.round(cw * scale)),
-                ),
-              },
-            };
-          }
           const scale = nw / r.origW;
           return { ...b, width: nw, height: Math.max(30, Math.round(r.origH * scale)) };
         });
@@ -569,8 +599,7 @@ export default function FreeformEditor({
       id: block.id,
       startX: e.clientX,
       startY: e.clientY,
-      // 表格以实际渲染宽度为基准（增删列后 block.width 可能过期）
-      origW: block.type === "table" && block.table ? tableTotalWidth(block.table) : block.width,
+      origW: block.width,
       origH: block.height,
     };
   };
@@ -2350,7 +2379,7 @@ export default function FreeformEditor({
                               <td
                                 key={ci}
                                 style={{
-                                  width: block.table!.colWidths[ci] ?? DEFAULT_COL_WIDTH,
+                                  width: block.table!.colWidths?.[ci] ?? DEFAULT_COL_WIDTH,
                                   border: block.table!.borderColor
                                     ? `1px solid ${block.table!.borderColor}`
                                     : undefined,
@@ -2397,13 +2426,6 @@ export default function FreeformEditor({
                     <div
                       className="ff-resize"
                       title="调整大小"
-                      onPointerDown={(e) => startResize(e, block)}
-                    />
-                  )}
-                  {selected && primary && !block.locked && block.type === "table" && (
-                    <div
-                      className="ff-resize"
-                      title="调整表格宽度"
                       onPointerDown={(e) => startResize(e, block)}
                     />
                   )}

@@ -1,9 +1,14 @@
-/** 笔记（自由画布：文字块/图片块/涂鸦，OneNote 式自由摆放） */
+/** 笔记编辑模式：自由画布 / Markdown / 富文本（创建时选定，之后锁定） */
+export type NoteEditMode = "freeform" | "markdown" | "richtext";
+
+/** 笔记 */
 export interface Note {
   id: string;
   title: string;
-  /** 自由画布场景 JSON */
-  blocks: string;
+  /** 编辑模式（决定打开笔记时用哪个编辑器），创建后不可切换 */
+  mode: NoteEditMode;
+  /** 当前模式下的内容：自由画布场景 JSON / Markdown 源码 / 富文本 HTML */
+  content: string;
   pinned: boolean;
   /** 所属分组 id，null 表示未分组 */
   groupId?: string | null;
@@ -122,3 +127,6 @@ export interface SyncStatus {
 }
 
 export type PageKey = "notes" | "accounts" | "documents" | "settings" | "about";
+
+/** 主题模式：浅色 / 深色 / 跟随系统 */
+export type ThemeMode = "light" | "dark" | "system";
